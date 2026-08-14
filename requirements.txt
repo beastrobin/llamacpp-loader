@@ -1,0 +1,4 @@
+# llamacpp-loader dependencies
+# Add at runtime:
+# httpx
+# llama-cpp-python

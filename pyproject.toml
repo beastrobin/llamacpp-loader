@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "llamacpp-loader"
+version = "0.1.0"
+description = "GUI launcher and manager for llama.cpp inference servers"
+requires-python = ">=3.10"
+dependencies = [
+    # No runtime dependencies yet — Tkinter is stdlib.
+    # Add requests or httpx once smoke_test uses it.
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+llamacpp-loader = "llamacpp_loader.main:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
