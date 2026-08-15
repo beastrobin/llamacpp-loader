@@ -413,14 +413,42 @@ class MainWindow:
         for col in self.TABLE_COLUMNS:
             w = self._tree.column(col, "width") or 0
             lbl = self._header_labels.get(col)
+            rsz = self._header_resizers.get(col)
             if lbl is None:
                 continue
             if w <= 0:
                 lbl.place_forget()
+                if rsz is not None:
+                    rsz.place_forget()
             else:
                 lbl.place(x=x, y=0, width=w, height=26)
+                if rsz is not None:
+                    rsz.place(x=x + w - 2, y=0)
                 x += w
         self._header_canvas.config(scrollregion=(0, 0, x, 26))
+
+    def _start_col_resize(self, col: str, event: tk.Event) -> None:
+        """Begin dragging a column border to resize the column."""
+        self._resize_col = col
+        self._resize_start_x = event.x_root
+        self._resize_start_w = self._tree.column(col, "width") or 0
+
+    def _do_col_resize(self, event: tk.Event) -> None:
+        """Resize the active column while the sash is being dragged."""
+        col = getattr(self, "_resize_col", None)
+        if col is None:
+            return
+        delta = event.x_root - self._resize_start_x
+        new_w = max(40, self._resize_start_w + delta)
+        self._tree.column(col, width=new_w)
+        self._relayout_header()
+        self._refresh_changed_overlays()
+
+    def _end_col_resize(self, _event: tk.Event | None = None) -> None:
+        """Finish a column resize and clear the drag state."""
+        self._resize_col = None
+        self._resize_start_x = 0
+        self._resize_start_w = 0
 
     def _build_model_table(self, parent: ttk.Frame) -> None:
         """Build the Treeview model table.
@@ -496,6 +524,11 @@ class MainWindow:
         self._header_canvas = tk.Canvas(parent, height=26, bg=theme.CARD,
                                         highlightthickness=0)
         self._header_labels: dict[str, tk.Label] = {}
+        self._header_resizers: dict[str, tk.Frame] = {}
+        # Track an active column resize so the mouse can stray past the handle.
+        self._resize_col: str | None = None
+        self._resize_start_x = 0
+        self._resize_start_w = 0
         # Map each group to its dedicated blank toggle column. The toggle cell
         # stays visible even when the rest of the group is collapsed, so the
         # group can always be re-expanded from the header.
@@ -523,6 +556,15 @@ class MainWindow:
             lbl.place(x=total_w, y=0, width=w, height=26)
             lbl.bind("<Button-1>", cmd)
             self._header_labels[col] = lbl
+
+            # Thin resize handle on the right edge of each header cell.
+            rsz = tk.Frame(self._header_canvas, width=4, height=26, bg=bg,
+                           cursor="sb_h_double_arrow")
+            rsz.place(x=total_w + w - 2, y=0)
+            rsz.bind("<Button-1>", lambda e, c=col: self._start_col_resize(c, e))
+            rsz.bind("<B1-Motion>", self._do_col_resize)
+            rsz.bind("<ButtonRelease-1>", self._end_col_resize)
+            self._header_resizers[col] = rsz
             total_w += w
         self._header_canvas.config(scrollregion=(0, 0, total_w, 26))
 
@@ -552,6 +594,10 @@ class MainWindow:
         self._tree.bind("<<TreeviewSelect>>", self._on_tree_select)
         self._tree.bind("<Double-1>", self._on_table_double_click)
         self._tree.bind("<Button-1>", self._on_table_click)
+        self._tree.bind("<Motion>", self._on_table_motion)
+        self._tree.bind("<Leave>", lambda _e: self._hide_tooltip())
+        self._tooltip: tk.Toplevel | None = None
+        self._tooltip_text = ""
         self._tree.bind("<Button-3>", self._on_table_click)  # right-click (lock)
         # Recompute green "changed" overlays whenever the tree is (re)laid out.
         self._tree.bind("<Configure>", lambda e: self._refresh_changed_overlays())
@@ -599,6 +645,47 @@ class MainWindow:
             self._open_mtp_menu(row_id)
         elif col == "presets":
             self._open_presets_menu(row_id, event.x_root, event.y_root)
+
+    def _on_table_motion(self, event: tk.Event) -> None:
+        """Show a tooltip with the full model name when hovering the model cell."""
+        region = self._tree.identify("region", event.x, event.y)
+        if region != "cell":
+            self._hide_tooltip()
+            return
+        col = self._tree.identify_column(event.x)
+        if col != "#1":  # only the model column
+            self._hide_tooltip()
+            return
+        row_id = self._tree.identify_row(event.y)
+        if not row_id or row_id.startswith("_vision_"):
+            self._hide_tooltip()
+            return
+        values = self._tree.item(row_id, "values")
+        if not values:
+            self._hide_tooltip()
+            return
+        text = str(values[0])
+        if text == self._tooltip_text:
+            return
+        self._show_tooltip(event.x_root + 12, event.y_root + 12, text)
+
+    def _show_tooltip(self, x: int, y: int, text: str) -> None:
+        self._hide_tooltip()
+        self._tooltip_text = text
+        self._tooltip = tk.Toplevel(self.root)
+        self._tooltip.wm_overrideredirect(True)
+        self._tooltip.wm_attributes("-topmost", True)
+        self._tooltip.configure(bg=theme.BORDER)
+        lbl = tk.Label(self._tooltip, text=text, bg=theme.CARD_ALT,
+                       fg=theme.TEXT, font=theme.FONT_SMALL, padx=6, pady=3)
+        lbl.pack()
+        self._tooltip.wm_geometry(f"+{x}+{y}")
+
+    def _hide_tooltip(self) -> None:
+        if getattr(self, "_tooltip", None):
+            self._tooltip.destroy()
+            self._tooltip = None
+        self._tooltip_text = ""
 
     def _toggle_reasoning(self, name: str) -> None:
         """Toggle the Thinking switch. Forced-ON models stay locked."""
