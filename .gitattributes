@@ -1,0 +1,10 @@
+# Normalize line endings across Windows / Linux / macOS so Python source
+# files are never committed with mixed CRLF/LF (avoids spurious diffs and
+# "syntax error" surprises when the repo is cloned on a different OS).
+* text=auto eol=lf
+
+# Binary assets must never have their line endings touched or be diffed as text.
+*.png binary
+*.jpg binary
+*.gguf binary
+*.bin binary
