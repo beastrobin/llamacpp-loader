@@ -211,9 +211,12 @@ class MainWindow:
         content.add(table_frame, stretch="always", minsize=200)
 
         # Console area split: Server Output (left, ~2/3) + Test Results (right, ~1/3)
+        # Keep ttk.PanedWindow here: the stock Windows Tk in this Python build does
+        # not expose opaqueresize on ttk.PanedWindow, and tk.PanedWindow.add() uses
+        # "stretch" instead of "weight". The reported ghost-trail was on the
+        # vertical list/console splitter (handled above), so the horizontal pane
+        # can stay on ttk.
         console_pane = ttk.PanedWindow(content, orient=tk.HORIZONTAL)
-        # Same ghost-trail fix as the vertical splitter above.
-        console_pane.configure(opaqueresize=False)
 
         server_frame = ttk.LabelFrame(console_pane, text="Server Output",
                                       padding=6, style="Card.TLabelframe")
