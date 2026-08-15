@@ -35,7 +35,9 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import socket
+import subprocess
 import threading
 import time
 import tkinter as tk
@@ -150,28 +152,36 @@ class MainWindow:
         main = ttk.Frame(self.root, padding=12)
         main.pack(fill=tk.BOTH, expand=True)
 
-        # First row: llama.cpp install path (user must pick it before first run)
-        self._build_path_row(main)
+        # Use a single 6-column grid for the whole top area. Row 0 holds the
+        # path selector + Hermes button; row 1 holds the six toolbar buttons.
+        # Because every top control lives in the *same* grid, column widths
+        # line up exactly — Hermes in column 5 is exactly as wide as Start
+        # Server in column 5.
+        for i in range(6):
+            main.columnconfigure(i, weight=1)
+        main.rowconfigure(3, weight=1)
+
+        # First row: llama.cpp install path (columns 0-4) + Hermes (column 5)
+        self._build_path_row(main, row=0)
+
+        self._toolbar_hermes_btn = ttk.Button(
+            main, text="启动Hermes", command=self._on_launch_hermes)
+        self._toolbar_hermes_btn.grid(row=0, column=5, sticky=tk.EW,
+                                      padx=(4, 0), pady=(0, 6))
 
         # Top row: model selector + buttons
-        toolbar = ttk.Frame(main)
-        toolbar.pack(fill=tk.X, pady=(0, 8))
-        self._build_toolbar(toolbar)
-
-        # Bottom: status bar. This is packed BEFORE the expandable content area
-        # so it reserves its natural height first; the PanedWindow above then
-        # only claims the remaining space. Otherwise content.pack(expand=True)
-        # hogs the whole frame and the status bar gets clipped off the bottom
-        # when the window is resized to the minimum height.
-        bottom = ttk.Frame(main)
-        bottom.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
-        self._status_bar = StatusBar(bottom)
+        self._build_toolbar(main, row=1)
 
         # Main content area: vertical PanedWindow so the user can drag the sash
         # between the model table and the console panes.
         content = tk.PanedWindow(main, orient=tk.VERTICAL, sashrelief=tk.RAISED,
                                  sashwidth=4, bg=theme.BORDER)
-        content.pack(fill=tk.BOTH, expand=True)
+        content.grid(row=2, column=0, columnspan=6, sticky=tk.NSEW)
+
+        # Bottom: status bar.
+        bottom = ttk.Frame(main)
+        bottom.grid(row=3, column=0, columnspan=6, sticky=tk.EW, pady=(8, 0))
+        self._status_bar = StatusBar(bottom)
         # opaqueresize=False: during sash drag only the sash line moves, panes
         # reflow on release. Avoids the severe smear/ghost trail that live
         # (opaque) resizing causes on Windows when the Treeview + console Text
@@ -1152,28 +1162,27 @@ class MainWindow:
         # Row backgrounds changed (selection/running) => recolour changed cells.
         self._refresh_changed_overlays()
 
-    def _build_path_row(self, parent: ttk.Frame) -> None:
+    def _build_path_row(self, parent: ttk.Frame, row: int = 0) -> None:
         """First row: llama.cpp install folder selector.
 
         Picks the folder that contains llama-server(.exe); persisted to
         UiState.llama_server_path so the process manager resolves the binary
         from there. New users must set this before the first launch.
         """
-        path_frame = ttk.Frame(parent)
-        path_frame.pack(fill=tk.X, pady=(0, 6))
-
         # Button on the LEFT, labelled "llamacpp path" (user-facing).
-        sel_btn = ttk.Button(path_frame, text="llamacpp path",
+        sel_btn = ttk.Button(parent, text="llamacpp path",
                              command=self._select_llamacpp_path)
-        sel_btn.pack(side=tk.LEFT, padx=(0, 6))
+        sel_btn.grid(row=row, column=0, sticky=tk.EW, padx=(0, 4),
+                     pady=(0, 6))
 
         self._llamacpp_path_var = tk.StringVar(
             value=self.store.get_ui_state().llama_server_path or "")
         self._llamacpp_path_label = ttk.Label(
-            path_frame, textvariable=self._llamacpp_path_var,
+            parent, textvariable=self._llamacpp_path_var,
             style="Dim.TLabel", anchor=tk.W)
-        self._llamacpp_path_label.pack(side=tk.LEFT, fill=tk.X, expand=True,
-                                        padx=(0, 6))
+        self._llamacpp_path_label.grid(row=row, column=1, columnspan=4,
+                                       sticky=tk.EW, padx=(4, 4),
+                                       pady=(0, 6))
 
         self._refresh_llamacpp_path_display()
 
@@ -1205,7 +1214,7 @@ class MainWindow:
             f"Saved:\n{d}\n\nThe model will use llama-server.exe from this "
             f"folder when launching.")
 
-    def _build_toolbar(self, parent: ttk.Frame) -> None:
+    def _build_toolbar(self, parent: ttk.Frame, row: int = 1) -> None:
         """Build the top toolbar: all controls on a single row.
 
         Buttons distributed evenly across the window width; each picks up a
@@ -1218,27 +1227,27 @@ class MainWindow:
 
         browse_btn = ttk.Button(parent, text="Add model",
                                 command=self._browse_model)
-        browse_btn.grid(row=0, column=0, sticky=tk.EW, padx=(0, 4))
+        browse_btn.grid(row=row, column=0, sticky=tk.EW, padx=(0, 4))
 
         remove_btn = ttk.Button(parent, text="Remove model",
                                 command=self._remove_selected_model)
-        remove_btn.grid(row=0, column=1, sticky=tk.EW, padx=(4, 4))
+        remove_btn.grid(row=row, column=1, sticky=tk.EW, padx=(4, 4))
 
         self._toolbar_stop_btn = ttk.Button(
             parent, text="Stop Server", command=self._on_stop, state=tk.DISABLED)
-        self._toolbar_stop_btn.grid(row=0, column=2, sticky=tk.EW, padx=(4, 4))
+        self._toolbar_stop_btn.grid(row=row, column=2, sticky=tk.EW, padx=(4, 4))
 
         self._toolbar_restart_btn = ttk.Button(
             parent, text="Restart Server", command=self._on_restart, state=tk.DISABLED)
-        self._toolbar_restart_btn.grid(row=0, column=3, sticky=tk.EW, padx=(4, 4))
+        self._toolbar_restart_btn.grid(row=row, column=3, sticky=tk.EW, padx=(4, 4))
 
         self._toolbar_smoke_btn = ttk.Button(
             parent, text="Smoke Test", command=self._on_smoke_test)
-        self._toolbar_smoke_btn.grid(row=0, column=4, sticky=tk.EW, padx=(4, 4))
+        self._toolbar_smoke_btn.grid(row=row, column=4, sticky=tk.EW, padx=(4, 4))
 
         self._toolbar_start_btn = ttk.Button(parent, text="Start Server", command=self._on_start,
                                              style="Accent.TButton")
-        self._toolbar_start_btn.grid(row=0, column=5, sticky=tk.EW, padx=(4, 0))
+        self._toolbar_start_btn.grid(row=row, column=5, sticky=tk.EW, padx=(4, 0))
 
     def _set_toolbar_running(self, running: bool) -> None:
         """Toggle Start/Stop/Restart button states in the toolbar."""
@@ -1255,6 +1264,86 @@ class MainWindow:
         """Update the model-selection label on the Model List header."""
         if hasattr(self, "_model_list_selected_label"):
             self._model_list_selected_label.config(text=f"Selected: {name}")
+
+    @staticmethod
+    def _resolve_hermes_exe() -> Optional[str]:
+        """Locate the Hermes CLI executable.
+
+        Prefers a ``hermes`` on PATH (the user's ``.hermes-venv-new`` Scripts
+        directory is on PATH), then falls back to the known venv location.
+        """
+        found = shutil.which("hermes")
+        if found:
+            return found
+        candidate = r"C:\Users\qiaoj\AI\.hermes-venv-new\Scripts\hermes.exe"
+        if os.path.isfile(candidate):
+            return candidate
+        return None
+
+    def _on_launch_hermes(self) -> None:
+        """Launch the Hermes agent in its own console window.
+
+        Hermes talks to a local llama-server through its llamacpp provider,
+        configured (in Hermes) to hit http://localhost:8080. We therefore
+        require a server listening on :8080 — launched with ``--jinja`` and
+        ctx-size >= 65536 — before handing off.
+        """
+        hermes_port = 8080
+        probe_host = "127.0.0.1"
+        if not self._port_in_use(probe_host, hermes_port):
+            # Nothing on the port Hermes expects. If the loader's own server is
+            # already running on a *different* port, warn instead of launching
+            # Hermes into a dead endpoint.
+            if getattr(self, "proc_mgr", None) is not None and self.proc_mgr.is_running():
+                running_port = getattr(self, "_active_port", "unknown")
+                self._status_bar.set_state(
+                    "error", f"Hermes needs :{hermes_port}, server on :{running_port}")
+                messagebox.showerror(
+                    "Hermes needs port 8080",
+                    f"Hermes is configured to talk to llama-server on port {hermes_port},\n"
+                    f"but the running server is on port {running_port}.\n\n"
+                    "Restart the server on port 8080 (with --jinja and ctx-size >= 65536),\n"
+                    "then launch Hermes again.")
+                return
+            # No server anywhere on :8080 — offer to start the selected profile.
+            if not messagebox.askyesno(
+                    "Start server first?",
+                    f"Hermes needs a llama-server listening on port {hermes_port}\n"
+                    "(launched with --jinja and ctx-size >= 65536).\n\n"
+                    "No server is detected on that port. Start the currently selected\n"
+                    "model now, then click '启动Hermes' again once the StatusBar shows\n"
+                    "'Server ready'? "):
+                return
+            self._on_start()
+            self._status_bar.set_state(
+                "running", "Server starting — click 启动Hermes again when ready")
+            messagebox.showinfo(
+                "Server starting",
+                "The selected model server is starting.\n\n"
+                "Wait until the StatusBar shows 'Server ready', then click the "
+                "'启动Hermes' button again to open the Hermes console.")
+            return
+
+        # Server is up on :8080 — launch Hermes in its own console window.
+        exe = self._resolve_hermes_exe()
+        if exe is None:
+            messagebox.showerror(
+                "Hermes not found",
+                "Could not locate the 'hermes' executable on PATH or in the expected\n"
+                r"virtualenv (C:\Users\qiaoj\AI\.hermes-venv-new\Scripts\hermes.exe)." "\n\n"
+                "Install/activate Hermes first, or add its Scripts directory to PATH.")
+            return
+
+        try:
+            # `start` opens a new console window; `cmd /k` keeps it open after
+            # the interactive Hermes session ends so trailing output is readable.
+            subprocess.Popen(
+                f'start "Hermes" cmd /k "{exe}"',
+                shell=True,
+            )
+            self._status_bar.set_state("running", "Hermes launched (separate window)")
+        except Exception as exc:  # noqa: BLE001 — surface any launch failure to the user
+            messagebox.showerror("Failed to launch Hermes", str(exc))
 
     def _remove_selected_model(self) -> None:
         """Delete the currently selected model profile from the store."""
