@@ -8,6 +8,14 @@ It folds the whole "pick a model → tune params → launch → test" workflow y
 
 ---
 
+## 🖼️ GUI Preview
+
+![llamacpp-loader GUI preview](docs/gui_preview.png)
+
+> Screenshot uses fictional demo models only — no real user model names or local paths are exposed.
+
+---
+
 ## ✨ Features
 
 | Feature | Description |
