@@ -1708,32 +1708,28 @@ class MainWindow:
             self._hsb.lift()
 
     def _sort_by_column(self, col: str) -> None:
-        """Click handler: sort by column. Toggle asc/desc on repeated clicks."""
+        """Click handler: sort by column. Toggle asc/desc on repeated clicks.
+
+        Clicking the active column flips direction (desc -> asc in one click);
+        clicking a new column starts at ascending. There is no "clear" state —
+        the previous sort is always replaced, which matches the expected
+        header-toggle UX.
+        """
         cur = self.SORT_STATE.get(col)
-        # Toggle between ascending and descending. Clicking the active column
-        # flips direction (desc -> asc in one click); clicking a new column
-        # starts at ascending. There is no "clear" state — the previous sort
-        # is always replaced, which matches the expected header-toggle UX.
+        # Toggle between ascending and descending.
         if cur == "desc":
             new_dir = "asc"
         else:  # None (new column) or "asc" -> flip to desc
             new_dir = "desc" if cur == "asc" else "asc"
         # Clear all sort state and set the new one
         self.SORT_STATE.clear()
-        if new_dir is not None:
-            self.SORT_STATE[col] = new_dir
+        self.SORT_STATE[col] = new_dir
 
-        # Persist the new sort for next launch (empty strings when cleared).
-        self.store.set_ui_state(
-            sort_column=(col if new_dir is not None else ""),
-            sort_dir=(new_dir or ""),
-        )
+        # Persist the new sort for next launch.
+        self.store.set_ui_state(sort_column=col, sort_dir=new_dir)
 
         # Update custom header labels to show the sort arrow.
         self._update_sort_headers()
-
-        if new_dir is None:
-            return  # show original order from the store
 
         sorted_names = sorted(
             self.store.list_profiles(),
