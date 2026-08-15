@@ -2189,6 +2189,37 @@ class MainWindow:
                     m = _re.search(r"([\d.]+)\s*tokens?/s", msg)
                     return float(m.group(1)) if m else None
 
+                def _pure_decode_speed(data):
+                    """Pure generation (decode) speed from llama.cpp timings.
+
+                    Uses the server's own measured generation phase (predicted_*
+                    or eval_*), which EXCLUDES prompt-processing time. This is the
+                    exact number the llama-server logs per request and is the
+                    standard llama.cpp benchmark metric, so the GUI Speed column
+                    now matches the terminal instead of undercounting by mixing in
+                    prompt processing. Falls back to None if timings are absent.
+                    """
+                    if not isinstance(data, dict):
+                        return None
+                    timings = data.get("timings") or {}
+                    if not timings:
+                        return None
+                    # Newer llama.cpp server keys
+                    pred_ms = timings.get("predicted_ms")
+                    pred_n = timings.get("predicted_n")
+                    if pred_ms and pred_n and pred_ms > 0:
+                        return pred_n / (pred_ms / 1000.0)
+                    # Older keys
+                    eval_ms = timings.get("eval_time_ms")
+                    eval_n = timings.get("eval_n_tokens")
+                    if eval_ms and eval_n and eval_ms > 0:
+                        return eval_n / (eval_ms / 1000.0)
+                    # Direct per-second field if present
+                    ps = timings.get("predicted_per_second") or timings.get("eval_per_second")
+                    if ps:
+                        return float(ps)
+                    return None
+
                 def _try_speed(url: str, payload: str, parse):
                     t0 = _time.time()
                     req = urllib.request.Request(
@@ -2203,12 +2234,18 @@ class MainWindow:
 
                 def _parse_completion(data, elapsed):
                     n = (data.get("usage", {}) or {}).get("completion_tokens") or 0
+                    pure = _pure_decode_speed(data)
+                    if pure is not None:
+                        return f"[OK] Generated {n} tokens -> {pure:.1f} tokens/s (decode, excl. prompt)"
                     if elapsed > 0:
                         return f"[OK] Generated {n} tokens in {elapsed:.1f}s -> {n / elapsed:.1f} tokens/s"
                     return "[OK] Generated 0 tokens"
 
                 def _parse_chat(data, elapsed):
                     n = (data.get("usage", {}) or {}).get("completion_tokens") or 0
+                    pure = _pure_decode_speed(data)
+                    if pure is not None:
+                        return f"[OK] Chat generated {n} tokens -> {pure:.1f} tokens/s (decode, excl. prompt)"
                     if elapsed > 0:
                         return f"[OK] Chat generated {n} tokens in {elapsed:.1f}s -> {n / elapsed:.1f} tokens/s"
                     return "[OK] Chat generated 0 tokens"

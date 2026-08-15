@@ -40,11 +40,12 @@ def main() -> None:
     gen_start = time.time()
     generated_tokens = None
     detail = ""
+    decode_speed = None  # pure generation speed from server timings
 
     try:
         body = json.dumps({
             "prompt": prompt,
-            "n_predict": 64,
+            "n_predict": 256,
             "temperature": 0.0,
             "stream": False,
         }).encode("utf-8")
@@ -94,12 +95,28 @@ def main() -> None:
                 generated_tokens = max(1, len(text) // 4)
                 detail = "estimated from generated text length (~4 chars/token)"
 
+            # Prefer server's own pure-decode timings (excludes prompt processing),
+            # so this matches the per-request speed the llama-server logs in the
+            # terminal. Falls back to wall-clock if timings are absent.
+            timings = (data or {}).get("timings") or {}
+            pred_ms = timings.get("predicted_ms")
+            pred_n = timings.get("predicted_n")
+            if pred_ms and pred_n and pred_ms > 0:
+                decode_speed = pred_n / (pred_ms / 1000.0)
+            else:
+                eval_ms = timings.get("eval_time_ms")
+                eval_n = timings.get("eval_n_tokens")
+                if eval_ms and eval_n and eval_ms > 0:
+                    decode_speed = eval_n / (eval_ms / 1000.0)
+
         print(f"\n=== Performance Measurement ===")
         print(f"Prompt: {prompt!r}")
         if generated_tokens is not None:
             print(f"Generated tokens: {generated_tokens} ({detail})")
             print(f"Generation time: {gen_time:.3f}s")
-            if gen_time > 0:
+            if decode_speed is not None:
+                print(f"Tokens/s (decode, excl. prompt): {decode_speed:.1f}   <-- matches llama-server terminal")
+            elif gen_time > 0:
                 print(f"Tokens/s (real): {generated_tokens / gen_time:.1f}")
         else:
             print(f"Generation time: {gen_time:.3f}s")
