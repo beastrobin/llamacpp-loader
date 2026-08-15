@@ -171,6 +171,11 @@ class MainWindow:
         content = tk.PanedWindow(main, orient=tk.VERTICAL, sashrelief=tk.RAISED,
                                  sashwidth=4, bg=theme.BORDER)
         content.pack(fill=tk.BOTH, expand=True)
+        # opaqueresize=False: during sash drag only the sash line moves, panes
+        # reflow on release. Avoids the severe smear/ghost trail that live
+        # (opaque) resizing causes on Windows when the Treeview + console Text
+        # widgets must be repainted every mouse-motion frame.
+        content.configure(opaqueresize=False)
 
         # Model list table (full width) with custom header row for Selected label
         table_frame = ttk.Frame(content)
@@ -207,6 +212,8 @@ class MainWindow:
 
         # Console area split: Server Output (left, ~2/3) + Test Results (right, ~1/3)
         console_pane = ttk.PanedWindow(content, orient=tk.HORIZONTAL)
+        # Same ghost-trail fix as the vertical splitter above.
+        console_pane.configure(opaqueresize=False)
 
         server_frame = ttk.LabelFrame(console_pane, text="Server Output",
                                       padding=6, style="Card.TLabelframe")
