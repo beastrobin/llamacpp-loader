@@ -33,11 +33,36 @@ def _setup_logging() -> None:
 _setup_logging()
 
 
+def _show_fatal(msg: str) -> None:
+    """Best-effort error dialog. Works even before the main root exists.
+
+    Falls back silently if Tk cannot be initialized (e.g. headless), since the
+    traceback is already written to the file handler in _setup_logging().
+    """
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+
+        r = tk.Tk()
+        r.withdraw()
+        messagebox.showerror("llamacpp-loader failed to start", msg)
+        r.destroy()
+    except Exception:
+        pass
+
+
 def main() -> None:
     import tkinter as tk
+    from tkinter import messagebox
     from llamacpp_loader.gui.app import MainWindow
 
-    root = tk.Tk()
+    try:
+        root = tk.Tk()
+    except Exception as exc:
+        logging.exception("Failed to initialize Tk root")
+        _show_fatal(f"Failed to initialize the GUI window:\n{exc}")
+        return
+
     root.title("llamacpp-loader")
     # Minimum window size: prevents buttons from being squashed below readable width
     root.minsize(960, 720)
@@ -48,9 +73,28 @@ def main() -> None:
         root.destroy()
     root.protocol("WM_DELETE_WINDOW", on_closing)
 
-    mw = MainWindow(root)
+    try:
+        mw = MainWindow(root)
+    except Exception as exc:
+        logging.exception("Failed to build MainWindow")
+        try:
+            messagebox.showerror(
+                "llamacpp-loader failed to start",
+                f"{exc}\n\n(See %APPDATA%\\llamacpp-loader\\app.log for the full traceback)",
+            )
+        except Exception:
+            pass
+        root.destroy()
+        return
+
     root.mainloop()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        # Last-resort safety net: anything that escapes main() is still logged
+        # and surfaced instead of being swallowed by pythonw.exe.
+        logging.exception("Unhandled exception during startup")
+        _show_fatal("Startup failed — see %APPDATA%\\llamacpp-loader\\app.log for details")
