@@ -223,7 +223,10 @@ class ProcessManager:
         # Start the process
         try:
             cmd = self._build_command(sc)
-            self._forward_log(f"Launching: {' '.join(cmd[:3])}...")
+            # Log the full command line so the operator can verify flags like
+            # -c (ctx size) actually made it into the launch, instead of only
+            # the first three tokens.
+            self._forward_log("Launching: " + " ".join(cmd))
 
             self._process = subprocess.Popen(
                 cmd,
