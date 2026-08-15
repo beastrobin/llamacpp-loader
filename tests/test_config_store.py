@@ -14,9 +14,9 @@ from llamacpp_loader.config.store import (
 
 
 @pytest.fixture()
-def store():
-    """A fresh ConfigStore backed by a temp file."""
-    tmp = Path(f"/tmp/llamacpp-test-config-{id(object())}.json")
+def store(tmp_path):
+    """A fresh ConfigStore backed by a cross-platform temp file."""
+    tmp = tmp_path / "config.json"
     s = ConfigStore(path=tmp)
     yield s
     try:

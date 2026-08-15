@@ -152,6 +152,12 @@ class SmokeTestRunner:
 
             # Parse HTTP status line
             if response:
+                if b"\r\n\r\n" not in response:
+                    return SmokeTestResult(
+                        status=SmokeResult.CONNECTION_ERROR,
+                        latency_ms=round(latency_ms),
+                        detail="Server closed connection before sending headers",
+                    )
                 header_end = response.index(b"\r\n\r\n")
                 headers = response[:header_end].decode("utf-8", errors="replace")
                 status_line = headers.split("\r\n")[0]  # "HTTP/1.1 200 OK"

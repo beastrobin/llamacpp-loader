@@ -16,6 +16,13 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from .metadata import (
+    base_stem_from_mtp,
+    find_mtp_draft,
+    is_mtp_draft_filename,
+    read_gguf_meta,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -138,6 +145,8 @@ class ServerParams:
 
     host: str = "127.0.0.1"
     port: int = 8080
+    flash_attn: str = "auto"      # Flash Attention: "auto" | "on" | "off"
+                                 # ("auto" enables it when the GPU/driver supports it)
 
     def __post_init__(self):
         object.__setattr__(self, "port", max(1, min(self.port, 65535)))
@@ -162,20 +171,45 @@ class ModelProfile:
 
     Each profile is keyed by ``profile_name`` (unique identifier).  The user-facing
     label for display purposes is stored in ``display_name``; the actual GGUF path
-    lives in ``model_path`` and ``gguf_file``.
+    lives in ``model_path`` and ``gguf_file``.  Multi-file models (e.g. vision
+    models with a separate mmproj file) keep additional files in ``extra_files`` —
+    the first ``extra_files`` entry is automatically passed to llama-server as
+    ``--mmproj`` when launching.
 
-    When persisted, only non-default values are written back to save space, but
-    ``to_dict()`` always returns a complete snapshot with defaults filled in.
+    ``presets`` holds named parameter archives ("default", "Preset 1", ...) — each
+    entry is a full snapshot of (server, inference, sampling) so users can flip
+    between saved configurations per model.
     """
 
     profile_name: str = ""           # unique key (e.g. "llama-3.2-3b-q4")
     display_name: str = ""           # human-readable label shown in GUI
     model_path: str = ""             # directory containing GGUF files
     gguf_file: str = ""              # selected GGUF filename (relative to model_path)
+    extra_files: list[str] = field(default_factory=list)  # additional GGUF files (mmproj etc.)
+
+    # Display / metadata columns
+    quant: str = ""                  # quantization level, e.g. "Q4_K_M" (parsed from filename)
+    kv_cache: str = "f16"            # KV cache type: f16 / q8_0 / q4_0 ...
+    speed: float = 0.0               # measured tokens/s (filled by smoke test)
+    reasoning: bool = False          # "Thinking" toggle — forced ON models can't be disabled
+    reasoning_forced: bool = False   # True => Thinking cannot be turned off (greyed "on*")
+
+    # Autonomous capability detection (read from the GGUF at scan/add time).
+    is_moe: bool = False             # Mixture-of-Experts (expert_count > 0)
+    mtp_supported: bool = False      # base model trained with MTP layers
+
+    # MTP (Multi-Token Prediction) speculative decoding.
+    mtp_enabled: bool = False        # use an MTP draft model at launch
+    mtp_model: str = ""             # draft GGUF filename (relative to model_path)
 
     server: ServerParams = field(default_factory=ServerParams)
     inference: InferenceParams = field(default_factory=InferenceParams)
     sampling: SamplingParams = field(default_factory=SamplingParams)
+
+    # Named parameter archives: preset_name -> full params snapshot dict
+    presets: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Which preset is currently applied (defaults to "default" when none)
+    active_preset: str = "default"
 
     def __post_init__(self):
         if not self.profile_name and self.gguf_file:
@@ -184,6 +218,88 @@ class ModelProfile:
             object.__setattr__(self, "profile_name", base.replace(" ", "-").lower())
         if not self.display_name:
             object.__setattr__(self, "display_name", self.profile_name or "Untitled Profile")
+        # Auto-detect quant from gguf filename if not set
+        if not self.quant and self.gguf_file:
+            q = self._detect_quant(self.gguf_file)
+            object.__setattr__(self, "quant", q)
+
+    @staticmethod
+    def _detect_quant(filename: str) -> str:
+        """Try to extract a quantization tag (e.g. Q4_K_M, IQ3_M) from filename."""
+        import re
+        stem = Path(filename).stem
+        for pat in (r"(?:IQ|Q|q)\d+_[A-Za-z0-9_]+", r"(?:IQ|Q|q)\d+_[A-Za-z]+", r"(?:IQ|Q|q)\d+"):
+            m = re.search(pat, stem)
+            if m:
+                return m.group(0)
+        return ""
+
+    # ------------------------------------------------------------------ presets
+    def params_snapshot(self) -> dict[str, Any]:
+        """Snapshot of (server, inference, sampling) for archiving."""
+        return {
+            "server": self.server.to_dict(),
+            "inference": self.inference.to_dict(),
+            "sampling": self.sampling.to_dict(),
+        }
+
+    def save_preset(self, name: str) -> None:
+        """Archive current params under *name* (e.g. 'default', 'Preset 1')."""
+        self.presets[name] = self.params_snapshot()
+        self.active_preset = name
+
+    def load_preset(self, name: str) -> bool:
+        """Apply an archived preset; returns False if missing."""
+        snap = self.presets.get(name)
+        if not snap:
+            return False
+        self.server = ServerParams.from_dict(snap.get("server", {}))
+        self.inference = InferenceParams.from_dict(snap.get("inference", {}))
+        self.sampling = SamplingParams.from_dict(snap.get("sampling", {}))
+        self.active_preset = name
+        return True
+
+    # ------------------------------------------------------------------ defaults
+    def _sampling_is_global_default(self) -> bool:
+        """True if the live sampling params equal the bare global defaults."""
+        g = SamplingParams()
+        s = self.sampling
+        return (
+            round(s.temperature, 6) == round(g.temperature, 6)
+            and s.top_k == g.top_k
+            and round(s.top_p, 6) == round(g.top_p, 6)
+            and round(s.repeat_penalty, 6) == round(g.repeat_penalty, 6)
+            and round(s.frequency_penalty, 6) == round(g.frequency_penalty, 6)
+            and round(s.presence_penalty, 6) == round(g.presence_penalty, 6)
+        )
+
+    def ensure_default_preset(self) -> bool:
+        """Populate the locked ``default`` preset with community-recommended sampling.
+
+        - If the ``default`` preset is missing, seed it from a snapshot of the
+          current params with the sampling group replaced by the community
+          recommendation for this model family.
+        - If the model is still sitting on the untouched global defaults and the
+          active preset is ``default``, apply the community recommendation to the
+          live sampling params (so existing models actually adopt good defaults).
+
+        Returns True if anything changed (so the caller can persist).
+        """
+        from .recommend import PRESET_DEFAULT, recommend_sampling
+
+        changed = False
+        if PRESET_DEFAULT not in self.presets:
+            snap = self.params_snapshot()
+            snap["sampling"] = recommend_sampling(self.profile_name).to_dict()
+            self.presets[PRESET_DEFAULT] = snap
+            changed = True
+
+        if not self.active_preset or self.active_preset == PRESET_DEFAULT:
+            rec = recommend_sampling(self.profile_name)
+            if self._sampling_is_global_default():
+                self.sampling = rec
+                changed = True
+        return changed
 
     def to_dict(self) -> dict[str, Any]:
         """Return a complete snapshot (all defaults filled in)."""
@@ -192,9 +308,21 @@ class ModelProfile:
             "display_name": self.display_name,
             "model_path": self.model_path,
             "gguf_file": self.gguf_file,
+            "extra_files": list(self.extra_files),
+            "quant": self.quant,
+            "kv_cache": self.kv_cache,
+            "speed": self.speed,
+            "reasoning": self.reasoning,
+            "reasoning_forced": self.reasoning_forced,
+            "is_moe": self.is_moe,
+            "mtp_supported": self.mtp_supported,
+            "mtp_enabled": self.mtp_enabled,
+            "mtp_model": self.mtp_model,
             "server": self.server.to_dict(),
             "inference": self.inference.to_dict(),
             "sampling": self.sampling.to_dict(),
+            "presets": {k: dict(v) for k, v in self.presets.items()},
+            "active_preset": self.active_preset,
         }
 
 
@@ -209,9 +337,21 @@ class ModelProfile:
             display_name=data.get("display_name", ""),
             model_path=data.get("model_path", ""),
             gguf_file=data.get("gguf_file", ""),
+            extra_files=list(data.get("extra_files", []) or []),
+            quant=data.get("quant", ""),
+            kv_cache=data.get("kv_cache", "f16"),
+            speed=float(data.get("speed", 0.0) or 0.0),
+            reasoning=bool(data.get("reasoning", False)),
+            reasoning_forced=bool(data.get("reasoning_forced", False)),
+            is_moe=bool(data.get("is_moe", False)),
+            mtp_supported=bool(data.get("mtp_supported", False)),
+            mtp_enabled=bool(data.get("mtp_enabled", False)),
+            mtp_model=str(data.get("mtp_model", "") or ""),
             server=ServerParams.from_dict(server_data),
             inference=InferenceParams.from_dict(inference_data),
             sampling=SamplingParams.from_dict(sampling_data),
+            presets=dict(data.get("presets", {}) or {}),
+            active_preset=data.get("active_preset", "default"),
         )
 
 
@@ -227,6 +367,9 @@ class ModelProfile:
             full_model = self.gguf_file
         else:
             full_model = ""
+        # Normalize: convert all backslashes to forward slashes (Windows
+        # accepts both, but mixed slashes confuse subprocess).
+        full_model = full_model.replace("\\", "/")
         return full_model, self.server.port
 
 
@@ -237,9 +380,46 @@ class UiState:
     window_width: int = 960
     window_height: int = 680
     last_browse_dir: str = ""       # remembered directory from Browse dialog
+    llama_server_path: str = ""     # absolute path to llama-server executable (auto-detected)
+    sort_column: str = ""           # last-used table sort column (restored on launch)
+    sort_dir: str = ""              # last-used sort direction: "asc" | "desc" | ""
 
 
 # --------------------------------------------------------------------------- config store
+
+
+def _enrich_profile_from_gguf(profile: "ModelProfile", gguf_path: Path,
+                              drafts: Optional[dict[str, Path]] = None) -> None:
+    """Best-effort: read GGUF metadata to populate MoE / MTP capability fields.
+
+    - Sets ``is_moe`` and ``mtp_supported`` from the GGUF (requires the optional
+      ``gguf`` package; silently skipped otherwise).
+    - Auto-pairs a sibling ``<base>-mtp.gguf`` draft model if present, enabling
+      MTP speculative decoding out of the box.
+    """
+    try:
+        meta = read_gguf_meta(str(gguf_path))
+    except Exception:  # noqa: BLE001
+        meta = {"ok": False}
+    if meta.get("ok"):
+        if meta.get("is_moe"):
+            object.__setattr__(profile, "is_moe", True)
+        if meta.get("mtp_supported"):
+            object.__setattr__(profile, "mtp_supported", True)
+
+    # Auto-detect a sibling MTP draft model.
+    base_stem = Path(gguf_path).stem.replace(" ", "-").lower()
+    draft_name: Optional[str] = None
+    if drafts and base_stem in drafts:
+        draft_name = drafts[base_stem].name
+    else:
+        try:
+            draft_name = find_mtp_draft(str(Path(gguf_path).parent), base_stem)
+        except Exception:  # noqa: BLE001
+            draft_name = None
+    if draft_name:
+        object.__setattr__(profile, "mtp_model", draft_name)
+        object.__setattr__(profile, "mtp_enabled", True)
 
 
 class ConfigStore:
@@ -283,6 +463,13 @@ class ConfigStore:
         self._profiles: dict[str, ModelProfile] = {}
         self._ui_state = UiState()
 
+        # Load persisted state from disk.  This is essential: without it the
+        # in-memory profile set stays empty on every launch, and the first-run
+        # branch in the GUI then overwrites the on-disk file with just the
+        # placeholder — which is exactly what made saved models "vanish"
+        # after restarting the loader.
+        self._load()
+
     # ------------------------------------------------------------------ load/save
     def _load(self) -> None:
         """Load settings from disk.  Creates defaults if file doesn't exist."""
@@ -325,7 +512,11 @@ class ConfigStore:
             valid_keys = UiState.__dataclass_fields__
             self._ui_state = UiState(**{k: v for k, v in ui_data.items() if k in valid_keys})
     def save(self) -> None:
-        """Persist current state to disk (thread-safe)."""
+        """Persist current state to disk (thread-safe).
+
+        The snapshot AND the atomic temp-file write both run inside the lock so
+        concurrent saves serialize and can never clobber each other's data.
+        """
         with self._lock:
             data = {
                 "_meta": {"version": self.CURRENT_VERSION},
@@ -333,17 +524,18 @@ class ConfigStore:
                 "profiles": {name: p.to_dict() for name, p in self._profiles.items()},
                 "ui_state": asdict(self._ui_state),
             }
-        # Atomic write via temp file + rename
-        tmp_path = self._path.with_suffix(".tmp")
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path.write_text(
-                json.dumps(data, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            os.replace(str(tmp_path), str(self._path))
-        except OSError as exc:
-            logger.error("Failed to save config %s: %s", self._path, exc)
+            # Atomic write via temp file + rename (kept inside the lock so
+            # concurrent saves serialize and never clobber each other).
+            tmp_path = self._path.with_suffix(".tmp")
+            try:
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                tmp_path.write_text(
+                    json.dumps(data, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                os.replace(str(tmp_path), str(self._path))
+            except OSError as exc:
+                logger.error("Failed to save config %s: %s", self._path, exc)
 
     def reload(self) -> None:
         """Force-reload from disk (useful after external edits)."""
@@ -397,26 +589,7 @@ class ConfigStore:
                 setattr(base.sampling, key, val)
         return base
 
-    # ------------------------------------------------------------------ UI state
-    def get_ui_state(self) -> UiState:
-        """Return a copy of the current UI state."""
-        with self._lock:
-            return UiState(**asdict(self._ui_state))
-
-    def set_ui_state(self, **kwargs: Any) -> None:
-        """Update one or more UI state fields and persist."""
-        with self._lock:
-            for key, val in kwargs.items():
-                if hasattr(self._ui_state, key):
-                    setattr(self._ui_state, key, val)
-        self.save()
-
-    # ------------------------------------------------------------------ context manager
-    def __enter__(self) -> ConfigStore:
-        return self
-
-    def __exit__(self, *args: Any) -> None:
-        self.save()
+    # (UI-state and context-manager methods are defined once, in the block below)
 
     # --------------------------------------------------------------------------- model discovery
     @classmethod
@@ -439,7 +612,19 @@ class ConfigStore:
         profiles: dict[str, ModelProfile] = {}
         root = Path(directory)
 
+        # Separate MTP draft files (e.g. "*-mtp.gguf") from base models so the
+        # drafts are not registered as standalone models. They are paired back
+        # to their base model below.
+        drafts: dict[str, Path] = {}  # base_stem -> draft path
+        base_files: list[Path] = []
         for gguf_file in root.rglob("*.gguf"):
+            stem = gguf_file.stem.replace(" ", "-").lower()
+            if is_mtp_draft_filename(stem):
+                drafts[base_stem_from_mtp(stem)] = gguf_file
+            else:
+                base_files.append(gguf_file)
+
+        for gguf_file in base_files:
             relative = gguf_file.relative_to(root)
             # profile_name from filename stem with path fragment for uniqueness
             base_name = gguf_file.stem.replace(" ", "-").lower()
@@ -462,6 +647,8 @@ class ConfigStore:
                 model_path=model_path,
                 gguf_file=gguf_file_rel,
             )
+            # --- autonomous capability detection (best effort) ---
+            _enrich_profile_from_gguf(profile, gguf_file, drafts)
             profiles[base_name] = profile
 
         return profiles

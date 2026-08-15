@@ -1,22 +1,39 @@
 [build-system]
 requires = ["setuptools>=68.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "llamacpp-loader"
-version = "0.1.0"
+version = "1.00"
 description = "GUI launcher and manager for llama.cpp inference servers"
+readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.10"
+authors = [{ name = "llamacpp-loader contributors" }]
 dependencies = [
-    # No runtime dependencies yet — Tkinter is stdlib.
-    # Add requests or httpx once smoke_test uses it.
+    # No hard runtime dependencies — Tkinter is part of the standard library.
+    # The optional `gguf` extra enables GGUF metadata auto-detection in scripts.
+]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+gui-extra = ["gguf"]
+
+[project.urls]
+Homepage = "https://github.com/beastrobin/llamacpp-loader"
+Repository = "https://github.com/beastrobin/llamacpp-loader"
 
 [project.scripts]
 llamacpp-loader = "llamacpp_loader.main:main"
+
+[tool.setuptools]
+packages = { find = { include = ["llamacpp_loader*"] } }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

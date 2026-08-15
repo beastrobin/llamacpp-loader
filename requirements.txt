@@ -1,4 +1,21 @@
 # llamacpp-loader dependencies
-# Add at runtime:
+#
+# Core runtime: NONE.
+# The GUI + llama-server launcher use only the Python standard library
+# (tkinter / subprocess / json / threading), so they work out of the box
+# with any official Python 3.10+ install. No `pip install` needed to run.
+#
+# ---------------------------------------------------------------------------
+# Optional runtime enhancement (recommended for best model auto-detection).
+# Mirrors the `gui-extra` extra in pyproject.toml — install on demand:
+#   pip install -e ".[gui-extra]"
+# gguf            # reads GGUF metadata to auto-detect MoE / MTP during scan_models()
+#
+# Optional, only used by scripts/smoke_live.py for advanced throughput probing:
 # httpx
 # llama-cpp-python
+#
+# ---------------------------------------------------------------------------
+# Dev / test dependency — mirrors the `dev` extra in pyproject.toml:
+#   pip install -e ".[dev]"
+# pytest          # run the test suite: pytest tests/ -v

@@ -30,10 +30,16 @@ env/
 *.swp
 *.swo
 
-# Runtime
-logs/
-models/*.gguf
-models/.gitkeep
+# Runtime logs (the app creates this dir on first run).
+logs/*
+!logs/.gitkeep
+# Local GGUF model binaries — never commit multi-GB weights.
+# Ignore everything under models/ except the .gitkeep placeholder so the
+# directory exists after a fresh clone.
+models/*
+!models/.gitkeep
+# Per-model parameters + UI state live in %APPDATA%\llamacpp-loader\settings.json
+# (outside this repo), so they are never tracked by git.
 
 # OS
 .DS_Store
@@ -41,5 +47,7 @@ Thumbs.db
 
 # Pytest
 .pytest_cache/
+# Sandbox/CI temp dir (e.g. created by pytest under restricted environments)
+.pytest_tmp/
 # Smoke test artifacts
 *.log

@@ -9,6 +9,7 @@ from __future__ import annotations
 import sys
 import time
 import json
+import socket
 from pathlib import Path
 
 # Add project root to path so we can import the package
@@ -34,64 +35,78 @@ def main() -> None:
         print("ERROR: Server health check failed. Aborting.")
         sys.exit(1)
 
-    # --- Phase 2: Send fixed prompt and measure tokens/s ---
-    # Fixed prompt as specified in the task
-    prompt = "用50字自我介绍"
-
-    # Build a simple generation request. We'll just measure inference timing
-    # by sending the prompt and observing the server response.
-    import socket
-
-    start_time = time.time()
-    token_count_estimate = 0
+    # --- Phase 2: Send a real generation request and measure tokens/s ---
+    prompt = "Introduce yourself in 50 words"
+    gen_start = time.time()
+    generated_tokens = None
+    detail = ""
 
     try:
+        body = json.dumps({
+            "prompt": prompt,
+            "n_predict": 64,
+            "temperature": 0.0,
+            "stream": False,
+        }).encode("utf-8")
+
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(10.0)
+        sock.settimeout(30.0)
         sock.connect(("127.0.0.1", 8080))
 
-        # Send a simple generate request (llama.cpp / OpenAI compat format)
-        # Using /completion or /v1/completions style - we'll use the /v1/models
-        # endpoint first to confirm, then send a generation request.
+        # Real /v1/completions request with a JSON body and Content-Length.
         request = (
-            f"POST /v1/completions HTTP/1.1\r\n"
-            f"Host: 127.0.0.1:8080\r\n"
-            f"Content-Type: application/json\r\n"
-            f"Connection: close\r\n"
-            f"\r\n"
-        )
-        # Actually, let's just measure round-trip with a minimal payload.
-        # The server may not have a /v1/completions endpoint; we'll just
-        # report what we can measure.
+            "POST /v1/completions HTTP/1.1\r\n"
+            "Host: 127.0.0.1:8080\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("utf-8") + body
+        sock.sendall(request)
 
-        sock.sendall(request.encode("utf-8"))
-
-        # Receive response
+        # Read the full response until the server closes the connection.
         response = b""
-        while b"\r\n\r\n" not in response:
-            chunk = sock.recv(4096)
+        while True:
+            chunk = sock.recv(8192)
             if not chunk:
                 break
             response += chunk
-
         sock.close()
-        fetch_time = time.time() - start_time
 
-        # Try to estimate token count from the prompt length
-        # Rough estimate: ~4 characters per token for Chinese text
-        estimated_tokens = len(prompt) // 4 + 10  # +10 for completion tokens
+        gen_time = time.time() - gen_start
+
+        if b"\r\n\r\n" not in response:
+            detail = "No HTTP response received from /v1/completions"
+        else:
+            header_end = response.index(b"\r\n\r\n")
+            body_bytes = response[header_end + 4:]
+            try:
+                data = json.loads(body_bytes.decode("utf-8", "replace"))
+            except ValueError:
+                data = None
+
+            usage = (data or {}).get("usage") or {}
+            if usage.get("completion_tokens"):
+                generated_tokens = int(usage["completion_tokens"])
+                detail = "from server usage.completion_tokens"
+            elif data and data.get("choices"):
+                text = data["choices"][0].get("text", "")
+                # Rough heuristic: ~4 chars per token (labelled as an estimate).
+                generated_tokens = max(1, len(text) // 4)
+                detail = "estimated from generated text length (~4 chars/token)"
 
         print(f"\n=== Performance Measurement ===")
         print(f"Prompt: {prompt!r}")
-        print(f"Estimated token count: {estimated_tokens}")
-        print(f"Round-trip time: {fetch_time:.3f}s")
-        if fetch_time > 0:
-            tokens_per_sec = estimated_tokens / fetch_time
-            print(f"Tokens/s (approx): {tokens_per_sec:.1f}")
+        if generated_tokens is not None:
+            print(f"Generated tokens: {generated_tokens} ({detail})")
+            print(f"Generation time: {gen_time:.3f}s")
+            if gen_time > 0:
+                print(f"Tokens/s (real): {generated_tokens / gen_time:.1f}")
+        else:
+            print(f"Generation time: {gen_time:.3f}s")
+            print(f"Note: {detail or 'could not parse a generation response'}")
 
     except Exception as e:
         print(f"\nError during performance measurement: {e}")
-        # Still report the health check result above
 
     print("\n=== Done ===")
 

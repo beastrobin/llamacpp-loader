@@ -13,6 +13,7 @@ import subprocess
 import threading
 import time
 import webbrowser
+from pathlib import Path
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Callable
@@ -59,12 +60,62 @@ class ServerConfig:
     temperature: float = 0.7
     top_k: int = 40
     top_p: float = 0.95
+    repeat_penalty: float = 1.1
+    kv_cache: str = "f16"          # f16 / q8_0 / q4_0
+    reasoning: bool = False        # --reasoning on/off
+    mmproj: str = ""               # vision projector GGUF path (--mmproj)
+    mtp_enabled: bool = False      # use an MTP draft model (speculative decoding)
+    mtp_model: str = ""            # draft GGUF path (--spec-draft-model)
+    mtp_n_max: int = 3             # max draft tokens (--spec-draft-n-max)
+    flash_attn: str = "auto"      # Flash Attention: "auto" | "on" | "off"
 
 
 # --------------------------------------------------------------------------- helpers
 
 def _is_windows() -> bool:
     return platform.system().lower().startswith("win")
+
+
+def _resolve_llama_server_executable(model_path: str = "", config_root: str = "") -> str:
+    """Locate llama-server.exe / llama-server.
+
+    Resolution order:
+      1. If *config_root* (user-configured llama.cpp install dir) is given and
+         contains llama-server.exe, use that.
+      2. Walk up from *model_path* looking for a directory that contains
+         llama-server.exe.
+      3. Walk up from *config_root* the same way.
+      4. Fall back to PATH lookup.
+      5. Final fallback: just the bare name.
+    """
+    import shutil
+    exe_win = "llama-server.exe"
+    exe_nix = "llama-server"
+
+    def try_dir(d: str) -> str | None:
+        if not d:
+            return None
+        p = Path(d)
+        for _ in range(8):  # walk up to 8 levels
+            for n in (exe_win, exe_nix):
+                cand = p / n
+                if cand.is_file():
+                    return str(cand)
+            if p.parent == p:
+                break
+            p = p.parent
+        return None
+
+    # 1. config_root
+    for n in (try_dir(config_root), try_dir(model_path)):
+        if n:
+            return n
+    # 2. PATH
+    found = shutil.which(exe_nix) or shutil.which(exe_win)
+    if found:
+        return found
+    # 3. Bare name
+    return exe_win if os.name == "nt" else exe_nix
 
 
 # --------------------------------------------------------------------------- process manager
@@ -90,13 +141,17 @@ class ProcessManager:
         mgr.stop()                          # graceful shutdown
     """
 
-    def __init__(self, *, log_callback: Optional[Callable[[str], None]] = None) -> None:
+    def __init__(self, *, log_callback: Optional[Callable[[str], None]] = None,
+                 config_store=None) -> None:
         self._log_callback = log_callback
         self._process: Optional[subprocess.Popen[bytes]] = None
         self._lock = threading.Lock()
         self._state = ProcessState.IDLE
         self._output_thread: Optional[threading.Thread] = None
         self._watcher_thread: Optional[threading.Thread] = None
+        # Cached llama-server path; auto-detected on first start, persisted later
+        self._config_store = config_store
+        self._cached_server_path: Optional[str] = None
 
     @property
     def state(self) -> ProcessState:
@@ -123,11 +178,23 @@ class ProcessManager:
                 return False
 
         # Extract ServerConfig from ModelProfile if needed
-        if isinstance(config, ModelProfile):
+        MP = _get_model_profile_class()
+        if isinstance(config, MP):
             server = config.server
             inference = config.inference
             sampling = config.sampling
             model_cmd, port = config.to_server_config()
+            # Pick the first extra file that looks like a vision projector
+            mmproj = ""
+            for f in config.extra_files:
+                if "mmproj" in f.lower() or "clip" in f.lower():
+                    mmproj = os.path.join(config.model_path, f) if config.model_path else f
+                    break
+            # MTP draft model (separate field so it is not confused with mmproj)
+            mtp_model = ""
+            if config.mtp_enabled and config.mtp_model:
+                mtp_model = (os.path.join(config.model_path, config.mtp_model)
+                             if config.model_path else config.mtp_model)
             sc = ServerConfig(
                 model_path=model_cmd,
                 host=server.host,
@@ -138,6 +205,14 @@ class ProcessManager:
                 temperature=sampling.temperature,
                 top_k=sampling.top_k,
                 top_p=sampling.top_p,
+                repeat_penalty=sampling.repeat_penalty,
+                kv_cache=config.kv_cache,
+                reasoning=config.reasoning,
+                mmproj=mmproj,
+                mtp_enabled=config.mtp_enabled,
+                mtp_model=mtp_model,
+                mtp_n_max=getattr(config, "mtp_n_max", 3),
+                flash_attn=getattr(config.server, "flash_attn", "auto"),
             )
         elif isinstance(config, ServerConfig):
             sc = config
@@ -156,9 +231,16 @@ class ProcessManager:
                 stderr=subprocess.STDOUT,
                 bufsize=1,           # line-buffered
                 universal_newlines=False,  # binary for cross-platform consistency
+                # CREATE_NO_WINDOW (0x08000000) hides the black console window
+                # that would otherwise pop up on Windows when launching the
+                # llama-server subprocess (e.g. triggered by Smoke Test).
+                creationflags=0x08000000 if os.name == "nt" else 0,
             )
         except OSError as exc:
+            import traceback
             self._forward_log(f"Failed to start process: {exc}")
+            self._forward_log(f"Traceback:\n{traceback.format_exc()}")
+            self._forward_log(f"Command was: {cmd}")
             self._set_state(ProcessState.ERROR)
             return False
 
@@ -176,6 +258,11 @@ class ProcessManager:
         self._watcher_thread = ProcessWatcher(self, poll_interval=1.0)
         self._watcher_thread.start()
 
+        # Record the config so the watchdog / restart() can re-launch on crash,
+        # and mark the process RUNNING so the watcher's auto-restart branch
+        # (which only fires for state == RUNNING) can actually trigger.
+        self._last_config = sc
+        self._set_state(ProcessState.RUNNING)
         return True
 
     def stop(self, grace_period: float = 5.0) -> bool:
@@ -210,9 +297,8 @@ class ProcessManager:
                 return False
         except OSError as exc:
             self._forward_log(f"Stop error: {exc}")
-            with self._lock:
-                if proc.poll() is not None:
-                    self._set_state(ProcessState.IDLE)
+            if proc.poll() is not None:
+                self._set_state(ProcessState.IDLE)
             return False
 
     def restart(self, config: ServerConfig | ModelProfile = None) -> bool:
@@ -258,7 +344,19 @@ class ProcessManager:
 
         Returns a flat list of command-line arguments suitable for subprocess.Popen.
         """
-        cmd = ["llama-server"]
+        # Determine llama-server executable path
+        config_root = ""
+        if self._config_store is not None:
+            try:
+                ui = self._config_store.get_ui_state()
+                config_root = ui.llama_server_path or ""
+            except Exception:
+                pass
+        exe = self._cached_server_path or _resolve_llama_server_executable(
+            config.model_path, config_root=config_root)
+        # Cache for next time
+        self._cached_server_path = exe
+        cmd = [exe]
 
         if config.model_path:
             cmd.extend(["--model", config.model_path])
@@ -276,10 +374,64 @@ class ProcessManager:
         # Threading
         cmd.extend(["-t", str(config.n_threads)])
 
+        # KV cache quantization
+        if config.kv_cache and config.kv_cache.lower() != "f16":
+            cmd.extend(["--cache-type-k", config.kv_cache.lower()])
+            cmd.extend(["--cache-type-v", config.kv_cache.lower()])
+
+        # Vision projector (only if the mmproj file actually exists — a missing
+        # file would otherwise make llama-server fail to start).
+        if config.mmproj:
+            if os.path.isfile(config.mmproj):
+                cmd.extend(["--mmproj", config.mmproj])
+            else:
+                self._forward_log(
+                    f"mmproj file not found, skipping vision: {config.mmproj}")
+
+        # MTP speculative decoding (Multi-Token Prediction). Requires a separate
+        # draft model GGUF; skipped if the file is missing so launch still works.
+        # Speculative decoding (MTP / DFlash / EAGLE3 draft model).
+        # IMPORTANT: --spec-type defaults to 'none', so the draft type MUST be
+        # set explicitly or llama-server silently ignores the draft model.
+        if config.mtp_enabled and config.mtp_model:
+            if os.path.isfile(config.mtp_model):
+                stem = config.mtp_model.lower().replace(" ", "-")
+                if "dflash" in stem:
+                    draft_type = "draft-dflash"
+                elif "eagle" in stem:
+                    draft_type = "draft-eagle3"
+                else:
+                    draft_type = "draft-mtp"
+                cmd.extend(["--spec-type", draft_type])
+                cmd.extend(["--spec-draft-model", config.mtp_model])
+                cmd.extend(["--spec-draft-n-max", str(config.mtp_n_max)])
+            else:
+                self._forward_log(
+                    f"draft model not found, skipping speculative decoding: {config.mtp_model}")
+
+        # Reasoning toggle (llama-server >= b4xxx supports --reasoning on/off).
+        # Only emit when enabling reasoning — "off" is the server default, so
+        # omitting it keeps us compatible with older llama-server builds that
+        # reject the unknown flag.
+        if config.reasoning:
+            cmd.extend(["--reasoning", "on"])
+
+        # Flash Attention — "auto" lets llama-server enable it when the GPU /
+        # driver supports it ("on" forces it, "off" disables).  Always emitted
+        # so behaviour is explicit and reproducible across launches.
+        if config.flash_attn:
+            cmd.extend(["--flash-attn", config.flash_attn])
+
+        # Jinja chat template — REQUIRED for correct chat formatting and tool
+        # calling. Verified on 2026-08-14: without --jinja, tool calls
+        # silently fail. Safe to enable for every model, so always on.
+        cmd.append("--jinja")
+
         # Sampling (llama-server flags)
         cmd.extend(["--temp", str(config.temperature)])
         cmd.extend(["--top-k", str(config.top_k)])
         cmd.extend(["--top-p", str(config.top_p)])
+        cmd.extend(["--repeat-penalty", str(config.repeat_penalty)])
 
         self._forward_log(f"Command: {' '.join(cmd)}")
         return cmd
@@ -335,25 +487,6 @@ class ProcessManager:
 
 # --------------------------------------------------------------------------- helpers
 
-def _log_callback_factory(callback):
-    """Create a one-shot logging function that also calls the callback."""
-    def log(line):
-        if callback:
-            try:
-                callback(line)
-            except Exception as e:
-                logger.error("UI callback error: %s", e)
-        else:
-            logger.info("[SERVER] %s", line)
-    return log
-
-
-def _browser_opener(port):
-    """Create a one-shot browser opener that fires after a short delay."""
-    def open_after_delay():
-        time.sleep(2.0)  # wait for server to be fully ready
-        webbrowser.open(f"http://localhost:{port}")
-    return threading.Thread(target=open_after_delay, daemon=True)
 
 
 # --------------------------------------------------------------------------- process watcher
@@ -392,7 +525,8 @@ class ProcessWatcher(threading.Thread):
                 if state == ProcessState.STOPPING:
                     continue  # expected shutdown
                 elif state == ProcessState.RUNNING and returncode != 0:
-                    self._forward_log(f"Server crashed with exit code {returncode}. Auto-restarting...")
+                    self._manager._forward_log(
+                        f"Server crashed with exit code {returncode}. Auto-restarting...")
                     self._manager.start(self._manager._last_config)  # type: ignore[arg-type]
 
     def stop_watching(self) -> None:
@@ -402,15 +536,14 @@ class ProcessWatcher(threading.Thread):
 
 # --------------------------------------------------------------------------- ModelProfile reference (imported at runtime)
 
-class _ModelProfilePlaceholder:
-    """Minimal interface expected from ModelProfile for ProcessManager.
-
-    This allows ProcessManager to work without importing gui.config.store
-    directly, avoiding circular imports. The actual class is defined in config/store.py.
-    """
-    pass
+_ModelProfile = None  # lazily imported to avoid circular imports
 
 
-# Type alias accepted by start()/restart() — resolved at runtime via duck typing.
-ModelProfile = _ModelProfilePlaceholder  # type: ignore[misc]
+def _get_model_profile_class():
+    """Import and cache the real ModelProfile class (config.store imports manager?)."""
+    global _ModelProfile
+    if _ModelProfile is None:
+        from llamacpp_loader.config.store import ModelProfile as _MP
+        _ModelProfile = _MP
+    return _ModelProfile
 

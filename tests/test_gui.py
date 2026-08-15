@@ -111,24 +111,25 @@ class TestStatusBar:
 
 
 class TestControlBar:
-    """Test ControlBar button state management."""
+    """Test toolbar button state management on MainWindow."""
 
-    def test_button_states(self, tk_root_fixture):
-        from unittest.mock import MagicMock
-        from llamacpp_loader.gui.app import ControlBar
+    def test_button_states(self, tk_root_fixture, tmp_path):
+        from unittest.mock import MagicMock, patch
+        from llamacpp_loader.config.store import ConfigStore
+        from llamacpp_loader.gui.app import MainWindow
 
-        root = tk_root_fixture
-        bar = ControlBar(
-            root,
-            start_callback=lambda: None,
-            stop_callback=lambda: None,
-            restart_callback=lambda: None,
-        )
+        # Isolate the store to a temp file so the test never touches the real
+        # %APPDATA%\llamacpp-loader\settings.json on the developer's machine.
+        isolated = ConfigStore(path=tmp_path / "settings.json")
+        with patch("llamacpp_loader.config.store.ConfigStore", return_value=isolated):
+            mw = MainWindow(tk_root_fixture)
 
-        # Initially all buttons should have their default states
-        assert str(bar._start_btn.cget("state")) == "normal"  # type: ignore[attr-defined]
-        assert str(bar._stop_btn.cget("state")) == "disabled"  # type: ignore[attr-defined]
+        # Initially: Start enabled, Stop/Restart disabled
+        assert str(mw._toolbar_start_btn.cget("state")) == "normal"  # type: ignore[attr-defined]
+        assert str(mw._toolbar_stop_btn.cget("state")) == "disabled"  # type: ignore[attr-defined]
+        assert str(mw._toolbar_restart_btn.cget("state")) == "disabled"  # type: ignore[attr-defined]
 
-        bar.set_buttons_running()
-        assert str(bar._start_btn.cget("state")) == "disabled"  # type: ignore[attr-defined]
-        assert str(bar._stop_btn.cget("state")) == "normal"  # type: ignore[attr-defined]
+        mw._set_toolbar_running(True)
+        assert str(mw._toolbar_start_btn.cget("state")) == "disabled"  # type: ignore[attr-defined]
+        assert str(mw._toolbar_stop_btn.cget("state")) == "normal"  # type: ignore[attr-defined]
+        assert str(mw._toolbar_restart_btn.cget("state")) == "normal"  # type: ignore[attr-defined]

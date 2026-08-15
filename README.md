@@ -1,94 +1,98 @@
 # llamacpp-loader
 
-**本地大模型加载器** —— 一个用 Tkinter 编写的 llama.cpp 服务器图形化管理工具。
+**Local LLM launcher** — a Tkinter-based graphical manager for running llama.cpp servers.
 
-把你以前靠手写 bat、记参数的"选模型 → 调参 → 启动 → 测试"流程，全部收进一个 GUI：
+It folds the whole "pick a model → tune params → launch → test" workflow you used to do with hand-written `.bat` files and sticky notes into a single GUI:
 
-![Python](https://img.shields.io/badge/Python-3.10%2B-blue) ![License](https://img.shields.io/badge/License-MIT-green) ![Tests](https://img.shields.io/badge/tests-60%20passed-brightgreen)
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue) ![License](https://img.shields.io/badge/License-MIT-green) ![Tests](https://img.shields.io/badge/tests-70%20passed-brightgreen)
 
 ---
 
-## ✨ 功能
+## ✨ Features
 
-| 功能 | 说明 |
+| Feature | Description |
 |---|---|
-| 🎯 **模型管理** | 文件选择器添加 GGUF 模型，自动生成 `ModelProfile`（每模型一套独立参数） |
-| 🔎 **自动发现** | `scan_models()` 递归扫描目录，自动识别所有 `.gguf` 并生成可读配置 |
-| ⚙️ **参数调节** | 启动参数（ctx / GPU 层数 / 线程数）+ 采样参数（temperature / top_k / top_p）可视化调整 |
-| 💾 **参数持久化** | 每个模型独立保存一套 JSON 配置，切换模型互不覆盖 |
-| 🚀 **一键启动** | 选择模型 → Start → 自动拉起 llama-server → 健康检查通过 → **自动打开 Web UI** |
-| 🧪 **冒烟测试** | `SmokeTestRunner` 检查 server 健康 + `scripts/smoke_live.py` 实测测速（tokens/s） |
-| 🛑 **优雅关闭** | 停止进程、释放显存/内存，支持崩溃自动重启（watchdog） |
+| 🎯 **Model management** | Add GGUF models via a file picker; each gets its own auto-generated `ModelProfile` (independent parameters per model) |
+| 🔎 **Auto-discovery** | `scan_models()` recursively scans a directory, detects every `.gguf` and builds a readable config |
+| ⚙️ **Parameter tuning** | Launch params (ctx / GPU layers / threads) + sampling params (temperature / top_k / top_p) with a visual editor |
+| 💾 **Parameter persistence** | Each model saves its own JSON config; switching models never overwrites another |
+| 🚀 **One-click launch** | Select model → Start → auto-spawns llama-server → health check passes → **opens the Web UI automatically** |
+| 🧪 **Smoke test** | `SmokeTestRunner` checks server health + `scripts/smoke_live.py` measures real throughput (tokens/s) |
+| 🛑 **Graceful shutdown** | Stops the process, releases VRAM/RAM, and supports crash auto-restart (watchdog) |
 
-## 📦 安装
+## 📦 Installation
 
 ```bash
-# 需要 Python 3.10+（官方版，含 tkinter）
+# Requires Python 3.10+ (official build, includes tkinter)
 git clone https://github.com/beastrobin/llamacpp-loader
 cd llamacpp-loader
 
-# 零第三方依赖（全 stdlib：tkinter / subprocess / json / threading）
-python -m llamacpp_loader.main     # 启动 GUI
+# Core runtime needs NO third-party deps (pure stdlib: tkinter / subprocess / json / threading).
+# Optional: `pip install gguf` enables automatic MoE / MTP metadata detection when scanning models.
+python -m llamacpp_loader.main     # launch the GUI
 ```
 
-> ⚠️ 注意：`llama-server.exe`（llama.cpp 本体）不包含在本仓库，请从 [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases) 自行获取。
+> ⚠️ Note: `llama-server.exe` (the llama.cpp binary itself) is **not** included in this repo. Download it from the [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases) page.
 
-## 🚀 使用流程
+## 🚀 Usage
 
-1. **添加模型**：点击 `Browse...` 选择 GGUF 模型文件，或输入目录让程序自动扫描
-2. **调参**：在 Inference / Sampling 面板调整参数（ctx_size、gpu_layers、temperature 等）
-3. **保存**：参数自动关联当前模型 profile，切换模型时各自独立
-4. **启动**：点击 `Start` → 程序拉起 llama-server → 健康检查 → 浏览器自动打开
-5. **冒烟测试**：运行 `python scripts/smoke_live.py` 实测服务器状态和生成速度
-6. **停止**：点击 `Stop` 优雅关闭，或崩溃后自动重启
+1. **Add a model**: click `Browse...` to pick a GGUF file, or point it at a directory to auto-scan
+2. **Tune params**: adjust parameters in the Inference / Sampling panel (ctx_size, gpu_layers, temperature, etc.)
+3. **Save**: parameters auto-attach to the current model profile; each model stays independent
+4. **Launch**: click `Start` → the app spawns llama-server → health check → browser opens automatically
+5. **Smoke test**: run `python scripts/smoke_live.py` to measure server status and generation speed
+6. **Stop**: click `Stop` to shut down gracefully, or let the watchdog auto-restart on crash
 
-## 🏗️ 架构
+## 🏗️ Architecture
 
 ```
 llamacpp-loader/
 ├── llamacpp_loader/
-│   ├── main.py                    # 入口：启动 Tkinter 应用
-│   ├── config/store.py            # ModelProfile 集合存储（每模型一套参数，JSON 持久化）
-│   │   ├── ModelProfile           # 模型 + ServerParams + InferenceParams + SamplingParams
-│   │   ├── ConfigStore            # CRUD + 参数校验 + 默认模板 + scan_models 自动发现
-│   │   └── ServerParams/...       # host/port、ctx/gpu/threads、temp/top_k/top_p
-│   ├── process_manager/manager.py # 子进程生命周期管理
-│   │   ├── ProcessManager         # Popen 封装 + 状态机（idle→starting→running→stopping）
-│   │   ├── ServerConfig           # 从 Profile 构建 llama-server 命令行参数
-│   │   └── ProcessWatcher         # 后台线程监控崩溃自动重启
-│   ├── smoke_test/runner.py       # 启动后健康验证
-│   │   ├── SmokeTestRunner        # /health 优先，404 回退 /v1/models
-│   │   └── ServerHealthChecker    # 同步单请求检查（供 pytest 用）
-│   └── gui/app.py                 # Tkinter GUI（MainWindow/ParameterPanel/ConsolePanel/StatusBar/ControlBar）
+│   ├── main.py                    # Entry point: launches the Tkinter app
+│   ├── config/store.py            # ModelProfile collection store (per-model params, JSON persistence)
+│   │   ├── ModelProfile           # model + ServerParams + InferenceParams + SamplingParams
+│   │   ├── ConfigStore            # CRUD + validation + default template + scan_models auto-discovery
+│   │   └── ServerParams/...       # host/port, ctx/gpu/threads, temp/top_k/top_p
+│   ├── config/recommend.py        # Preset recommendations / baselines
+│   ├── config/metadata.py         # GGUF metadata reader (MoE / MTP detection)
+│   ├── process_manager/manager.py # Subprocess lifecycle management
+│   │   ├── ProcessManager         # Popen wrapper + state machine (idle→starting→running→stopping)
+│   │   ├── ServerConfig           # Builds llama-server CLI args from a Profile
+│   │   └── ProcessWatcher         # Background thread watches for crashes and auto-restarts
+│   ├── smoke_test/runner.py       # Post-launch health validation
+│   │   ├── SmokeTestRunner        # /health first, falls back to /v1/models on 404
+│   │   └── ServerHealthChecker    # Synchronous single-request check (for pytest)
+│   ├── gui/app.py                 # Tkinter GUI (MainWindow/ParameterPanel/ConsolePanel/StatusBar/ControlBar)
+│   └── gui/theme.py               # Dark theme styling (colors, fonts, ttk styles)
 ├── scripts/
-│   └── smoke_live.py              # 真机冒烟测试：健康检查 + 测速（tokens/s）
-├── tests/                         # 60 个 pytest 测试
-│   ├── test_config_store.py       # 27 个：CRUD/校验/持久化/扫描
-│   ├── test_process_manager.py    # 15 个：生命周期/命令构建/浏览器
-│   ├── test_smoke_test.py         # 8 个：结果构造/端点
-│   └── test_gui.py                # 6 个：组件创建/状态（共享 Tk root fixture）
-├── models/                        # 本地 GGUF 模型目录
-└── logs/                          # 运行时日志
+│   ├── smoke_live.py              # Live smoke test: health check + throughput (tokens/s)
+│   ├── register_all_models.py     # Batch-register GGUF models (MoE/MTP auto-detect)
+│   └── e2e_smoke_check.py         # Headless end-to-end Start -> Smoke Test check
+├── tests/                         # 70 pytest tests
+│   ├── test_config_store.py       # CRUD/validation/persistence/scan_models
+│   ├── test_process_manager.py    # lifecycle/command-build/browser
+│   ├── test_smoke_test.py         # result construction/endpoint checks
+│   ├── test_gui.py                # component creation/state (shared Tk root fixture)
+│   ├── test_kv_edit_unlock.py     # KV/ctx/gpu/threads editing vs sampling lock
+│   └── test_overlay_double_click.py # changed-cell overlay double-click detection
+├── models/                        # Local GGUF model directory
+└── logs/                          # Runtime logs
 ```
 
-## 🧪 测试
+## 🧪 Tests
 
 ```bash
 pip install pytest
-pytest tests/ -v          # 60 tests，10 次连跑稳定
-python scripts/smoke_live.py   # 真机冒烟测试（需 llama-server 在 8080 运行）
+pytest tests/ -v          # 70 tests, stable across consecutive runs
+python scripts/smoke_live.py   # live smoke test (requires llama-server running on 8080)
 ```
 
-## 📝 设计要点
+## 📝 Design notes
 
-- **每模型一套参数**：ModelProfile 把模型文件 + 启动参数 + 采样参数绑定，杜绝"换个模型参数被覆盖"
-- **线程安全**：ConfigStore 用 Lock、ProcessManager 状态变更全加锁、GUI 回调走 `root.after()`
-- **健壮的进程管理**：优雅 SIGTERM + 超时 SIGKILL + 后台 watchdog 崩溃自愈
-- **零依赖**：全 Python 标准库，开箱即用
-
-## 🤖 关于本项目
-
-本项目由 **本地大模型（Qwen3.6-35B-A3B / Nemotron-3.5-30B-A3B，跑在 RTX 5090 + llama.cpp）通过 Hermes Agent 自主开发**，人工负责需求评审与验收。从一个"验证本地模型写代码能力"的实验，长成了一个真正能用的工具。
+- **One parameter set per model**: `ModelProfile` binds the model file + launch params + sampling params together, eliminating "switch models and lose my params"
+- **Thread safety**: `ConfigStore` uses a Lock, `ProcessManager` locks all state changes, and GUI callbacks run through `root.after()`
+- **Robust process management**: graceful SIGTERM + SIGKILL on timeout + background watchdog for crash self-healing
+- **Core runtime is dependency-free**: pure Python standard library, works out of the box. An **optional** `gguf` package (`pip install gguf`) auto-detects MoE / MTP model metadata during `scan_models()` — without it the tool still launches and runs, just without that metadata enhancement.
 
 ## 📄 License
 

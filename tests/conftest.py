@@ -10,18 +10,17 @@ tk = pytest.importorskip("tkinter")
 @pytest.fixture(scope="session")
 def tk_root():
     """Session-scoped Tk root window shared across all GUI tests.
-    
+
     Creates one Tk instance per test session and yields it to tests.
     Tests must call root.destroy() or the fixture will clean up after the session.
     """
     root = tk.Tk()
     root.withdraw()  # Hide during testing; tests can deiconify if needed
+    # Apply the production theme so styled ttk widgets (Accent.TButton, etc.) are registered
+    from llamacpp_loader.gui.theme import apply
+    apply(root)
     yield root
     root.destroy()
-
-from unittest.mock import MagicMock
-
-import pytest
 
 from llamacpp_loader.config.store import ConfigStore, ModelProfile
 from llamacpp_loader.process_manager.manager import ServerConfig
