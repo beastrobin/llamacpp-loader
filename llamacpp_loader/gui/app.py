@@ -449,8 +449,12 @@ class MainWindow:
                         fieldbackground=theme.CARD, foreground=theme.TEXT,
                         bordercolor=theme.BORDER, relief="flat",
                         rowheight=24, font=theme.FONT_SMALL)
+        # The selection background is supplied by the selected_row.Treeview
+        # row tag, which paints one continuous bar. Do NOT also set it via
+        # style.map: on Windows the native "selected" background is drawn
+        # cell-by-cell and overlaps the tag background, producing gaps / a
+        # disconnected highlight bar across columns.
         style.map("NoHead.Treeview",
-                  background=[("selected", theme.ACCENT)],
                   foreground=[("selected", "#ffffff")])
 
         self._tree = ttk.Treeview(
