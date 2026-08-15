@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import logging
 import os
+import socket
 import threading
 import time
 import tkinter as tk
@@ -1941,11 +1942,39 @@ class MainWindow:
 
         return profile
 
+    @staticmethod
+    def _port_in_use(host: str, port: int, timeout: float = 0.5) -> bool:
+        """Return True if a TCP listener answers on (host, port)."""
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            return False
+
     def _do_start_profile(self, profile: ModelProfile) -> bool:
         """Launch the server for *profile* and update the UI.
 
         Returns True on successful process launch. Does NOT run a smoke test.
         """
+        # Guard against launching a duplicate server. If the target port is
+        # already occupied (typically an orphaned llama-server left running by a
+        # previous loader session that was closed without stopping), refuse
+        # instead of blindly spawning a second process and doubling VRAM/RAM.
+        host = profile.server.host
+        probe_host = "127.0.0.1" if (not host or host in ("0.0.0.0",)) else host
+        if self._port_in_use(probe_host, profile.server.port):
+            self._status_bar.set_state(
+                "error", f"Port {profile.server.port} already in use")
+            messagebox.showerror(
+                "Port Already In Use",
+                f"Something is already listening on port {profile.server.port}.\n\n"
+                "This is usually a leftover llama-server from a previous loader "
+                "session that was closed without stopping it.\n\n"
+                "Stop that process first (e.g. end 'llama-server.exe' in Task "
+                "Manager, or run:  taskkill /f /im llama-server.exe), then start "
+                "again — or pick a different port for this profile.")
+            return False
+
         success = self.proc_mgr.start(profile)
         if not success:
             self._status_bar.set_state("error", "Failed to start server")
@@ -2567,11 +2596,22 @@ def create_app(root=None):
     """
     if root is None:
         root = tk.Tk()
-        # Clean exit on window close
+        mw = MainWindow(root)
+
+        # Clean exit on window close: gracefully stop the managed llama-server
+        # so it does not linger as an orphan still holding VRAM/RAM after the GUI
+        # exits. This is what prevented re-opening the loader from spawning a
+        # second server on top of the first (double VRAM).
         def on_closing():
-            mw.root.after(0, lambda: logger.info("App closing"))
+            logger.info("App closing — stopping managed server if running")
+            try:
+                mw.proc_mgr.stop()
+            except Exception as exc:  # never block window close on stop failure
+                logger.warning("Error stopping server on close: %s", exc)
             root.destroy()
+
         root.protocol("WM_DELETE_WINDOW", on_closing)
+        return mw
     return MainWindow(root)
 
 
