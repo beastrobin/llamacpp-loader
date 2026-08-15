@@ -15,20 +15,20 @@ Layout::
     | temp:      [0.7      ]    | top_k:       [40        ]         |
     | top_p:     [0.95     ]    | top_p (server):[0.95     ]        |
     |                           +-------------------------------------+
-    | [Browse Model] [Start] [Stop] [Restart] Status: idle           |
-    +---------------------------------------------------------------+
+    | [Browse Model] [Start Server] [Stop Server] [Restart Server] Status: idle|
+    +--------------------------------------------------------------------------+
 
 Control flow::
     1. User clicks "Browse" -> file dialog selects GGUF model directory
     2. Profile list auto-refreshes from ConfigStore
     3. User selects a profile, params populate the fields
-    4. User clicks "Start":
+    4. User clicks "Start Server":
        a. Build ModelProfile from widget state (or use selected profile)
        b. ProcessManager.start(profile) -> launches llama-server subprocess
        c. SmokeTestRunner.wait_until_ready() polls health endpoint
        d. On PASS: webbrowser.open(http://localhost:<port>)
        e. ConsolePanel starts streaming server output
-    5. User clicks "Stop" or process exits
+    5. User clicks "Stop Server" or process exits
 """
 
 from __future__ import annotations
@@ -1225,18 +1225,18 @@ class MainWindow:
         remove_btn.grid(row=0, column=1, sticky=tk.EW, padx=(4, 4))
 
         self._toolbar_stop_btn = ttk.Button(
-            parent, text="Stop", command=self._on_stop, state=tk.DISABLED)
+            parent, text="Stop Server", command=self._on_stop, state=tk.DISABLED)
         self._toolbar_stop_btn.grid(row=0, column=2, sticky=tk.EW, padx=(4, 4))
 
         self._toolbar_restart_btn = ttk.Button(
-            parent, text="Restart", command=self._on_restart, state=tk.DISABLED)
+            parent, text="Restart Server", command=self._on_restart, state=tk.DISABLED)
         self._toolbar_restart_btn.grid(row=0, column=3, sticky=tk.EW, padx=(4, 4))
 
         self._toolbar_smoke_btn = ttk.Button(
             parent, text="Smoke Test", command=self._on_smoke_test)
         self._toolbar_smoke_btn.grid(row=0, column=4, sticky=tk.EW, padx=(4, 4))
 
-        self._toolbar_start_btn = ttk.Button(parent, text="Start", command=self._on_start,
+        self._toolbar_start_btn = ttk.Button(parent, text="Start Server", command=self._on_start,
                                              style="Accent.TButton")
         self._toolbar_start_btn.grid(row=0, column=5, sticky=tk.EW, padx=(4, 0))
 
