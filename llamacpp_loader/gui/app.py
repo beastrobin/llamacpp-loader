@@ -1708,15 +1708,16 @@ class MainWindow:
             self._hsb.lift()
 
     def _sort_by_column(self, col: str) -> None:
-        """Click handler: sort by column. Toggle asc/desc/none on repeated clicks."""
+        """Click handler: sort by column. Toggle asc/desc on repeated clicks."""
         cur = self.SORT_STATE.get(col)
-        # Cycle: None -> asc -> desc -> None
-        if cur is None:
+        # Toggle between ascending and descending. Clicking the active column
+        # flips direction (desc -> asc in one click); clicking a new column
+        # starts at ascending. There is no "clear" state — the previous sort
+        # is always replaced, which matches the expected header-toggle UX.
+        if cur == "desc":
             new_dir = "asc"
-        elif cur == "asc":
-            new_dir = "desc"
-        else:
-            new_dir = None
+        else:  # None (new column) or "asc" -> flip to desc
+            new_dir = "desc" if cur == "asc" else "asc"
         # Clear all sort state and set the new one
         self.SORT_STATE.clear()
         if new_dir is not None:
