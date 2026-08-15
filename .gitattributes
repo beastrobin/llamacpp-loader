@@ -3,6 +3,10 @@
 # "syntax error" surprises when the repo is cloned on a different OS).
 * text=auto eol=lf
 
+# Windows batch scripts must stay CRLF - LF-only .bat files can misparse in
+# some cmd versions (broken `if`/`setlocal` blocks). Keep them out of eol=lf.
+*.bat text eol=crlf
+
 # Binary assets must never have their line endings touched or be diffed as text.
 *.png binary
 *.jpg binary

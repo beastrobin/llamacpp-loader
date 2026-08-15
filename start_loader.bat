@@ -1,52 +1,37 @@
 @echo off
-chcp 65001 >nul
-setlocal enabledelayedexpansion
+setlocal
 
-:: Launch the GUI without a persistent console window.
-:: pythonw.exe runs Python without allocating a console, so no black window stays open.
-:: Logs are written to %APPDATA%\llamacpp-loader\app.log.
-::
-:: We must verify the chosen interpreter can actually import llamacpp_loader:
-:: WorkBuddy's bundled pythonw sits ahead on PATH but does NOT have the package
-:: installed, so trusting `where` order alone would launch it, fail with a silent
-:: ModuleNotFoundError (swallowed by pythonw), and the window would never appear.
+:: Lock cwd to the project root so `-m llamacpp_loader.main` resolves.
+pushd "%~dp0"
 
-set "PYW_EXE="
-set "PYW_ARGS="
-
-:: 1) Any pythonw.exe on PATH, in PATH order — use the first that imports the package.
-for /f "delims=" %%I in ('where pythonw.exe 2^>nul') do (
-    if not defined PYW_EXE (
-        "%%I" -c "import llamacpp_loader" >nul 2>nul
-        if not errorlevel 1 (
-            set "PYW_EXE=%%I"
-        )
-    )
-)
-
-:: 2) Fall back to the py launcher (-3 picks the latest Python 3).
-if not defined PYW_EXE (
-    for /f "delims=" %%I in ('where py.exe 2^>nul') do (
-        if not defined PYW_EXE (
-            "%%I" -3 -c "import llamacpp_loader" >nul 2>nul
-            if not errorlevel 1 (
-                set "PYW_EXE=%%I"
-                set "PYW_ARGS=-3"
+:: Locate a Python interpreter on PATH (no hard-coded user paths - keeps the
+:: script portable and avoids leaking the local username into a public repo).
+:: Prefer pythonw (no console window); fall back to python (console) if missing.
+:: Each candidate is verified to actually import llamacpp_loader before use.
+set "PYW="
+for %%P in (pythonw python) do (
+    if not defined PYW (
+        for /f "delims=" %%I in ('where %%P 2^>nul') do (
+            if not defined PYW (
+                "%%I" -c "import llamacpp_loader" >nul 2>nul
+                if not errorlevel 1 set "PYW=%%I"
             )
         )
     )
 )
 
-if not defined PYW_EXE (
-    echo ERROR: No Python interpreter with llamacpp-loader installed was found.
-    echo Install it from the project root with:  pip install -e .
-    echo Then re-run this script.
-    pause
+if not defined PYW (
+    if not exist "%APPDATA%\llamacpp-loader" mkdir "%APPDATA%\llamacpp-loader" >nul 2>nul
+    >>"%APPDATA%\llamacpp-loader\app.log" echo %DATE% %TIME% ERROR: no Python with llamacpp_loader found on PATH
     exit /b 1
 )
 
-if defined PYW_ARGS (
-    start "" "%PYW_EXE%" %PYW_ARGS% -m llamacpp_loader.main
-) else (
-    start "" "%PYW_EXE%" -m llamacpp_loader.main
+:: Launch hidden via PowerShell: the console window flashes and closes by
+:: itself, only the GUI stays. NOTE: keep this file ASCII-only - non-ASCII
+:: chars (UTF-8) get mangled by cmd's GBK parsing and break the script.
+powershell -NoProfile -Command "Start-Process -WindowStyle Hidden -FilePath '%PYW%' -ArgumentList '-m','llamacpp_loader.main' -WorkingDirectory '%CD%'" >nul 2>nul
+if errorlevel 1 (
+    :: PowerShell blocked -> visible console fallback (window stays, GUI opens).
+    "%PYW%" -u -m llamacpp_loader.main
 )
+exit /b
