@@ -462,6 +462,7 @@ class ConfigStore:
         )
         self._profiles: dict[str, ModelProfile] = {}
         self._ui_state = UiState()
+        self._agents: list[dict] = []
 
         # Load persisted state from disk.  This is essential: without it the
         # in-memory profile set stays empty on every launch, and the first-run
@@ -511,6 +512,14 @@ class ConfigStore:
         if ui_data:
             valid_keys = UiState.__dataclass_fields__
             self._ui_state = UiState(**{k: v for k, v in ui_data.items() if k in valid_keys})
+
+        # Load external agents (generic launcher targets).
+        agents_raw = raw.get("agents")
+        if isinstance(agents_raw, list):
+            self._agents = agents_raw
+        else:
+            self._agents = []
+
     def save(self) -> None:
         """Persist current state to disk (thread-safe).
 
@@ -523,6 +532,7 @@ class ConfigStore:
                 "defaults": self._defaults.to_dict(),
                 "profiles": {name: p.to_dict() for name, p in self._profiles.items()},
                 "ui_state": asdict(self._ui_state),
+                "agents": self._agents,
             }
             # Atomic write via temp file + rename (kept inside the lock so
             # concurrent saves serialize and never clobber each other).
@@ -697,6 +707,22 @@ class ConfigStore:
             del self._profiles[name]
         self.save()
         return True
+
+    # ------------------------------------------------------------------ agents
+    def get_agents(self) -> list[dict]:
+        """Return the configured external agents.  Caller owns any edits."""
+        with self._lock:
+            return self._agents
+
+    def replace_agents(self, agents: list[dict]) -> None:
+        """Replace the whole agent list and persist atomically.
+
+        The GUI manages the in-memory list and calls this once after edits
+        (add / update / remove / reorder).
+        """
+        with self._lock:
+            self._agents = list(agents)
+        self.save()
 
     def load(self, name: str) -> Optional[ModelProfile]:
         """Retrieve a profile by name. Returns None if not found."""
