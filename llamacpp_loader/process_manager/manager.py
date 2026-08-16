@@ -382,14 +382,19 @@ class ProcessManager:
             cmd.extend(["--cache-type-k", config.kv_cache.lower()])
             cmd.extend(["--cache-type-v", config.kv_cache.lower()])
 
-        # Vision projector (only if the mmproj file actually exists — a missing
-        # file would otherwise make llama-server fail to start).
+        # Vision projector. If the profile explicitly declares an mmproj but the
+        # file is missing, FAIL LOUDLY instead of silently launching a text-only
+        # server: a silent downgrade is exactly what makes vision "look broken"
+        # (the service starts fine but image input does nothing). The raised
+        # FileNotFoundError (an OSError subclass) is caught by start()'s
+        # try/except, which logs it and moves the server to the ERROR state.
         if config.mmproj:
             if os.path.isfile(config.mmproj):
                 cmd.extend(["--mmproj", config.mmproj])
             else:
-                self._forward_log(
-                    f"mmproj file not found, skipping vision: {config.mmproj}")
+                raise FileNotFoundError(
+                    "Declared mmproj projector not found, refusing to start a "
+                    f"vision-less server: {config.mmproj}")
 
         # MTP speculative decoding (Multi-Token Prediction). Requires a separate
         # draft model GGUF; skipped if the file is missing so launch still works.
