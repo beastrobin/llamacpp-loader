@@ -174,13 +174,16 @@ class MainWindow:
         main = ttk.Frame(self.root, padding=12)
         main.pack(fill=tk.BOTH, expand=True)
 
-        # First row: llama.cpp install path (user must pick it before first run)
-        self._build_path_row(main)
+        # Single topbar frame shared by path row AND toolbar so the two rows
+        # use the *same* 6-column grid with `uniform="topbar"` — column widths
+        # (and therefore button widths) are guaranteed to match exactly.
+        topbar = ttk.Frame(main)
+        topbar.pack(fill=tk.X)
+        for i in range(6):
+            topbar.columnconfigure(i, weight=1, uniform="topbar")
 
-        # Top row: model selector + buttons
-        toolbar = ttk.Frame(main)
-        toolbar.pack(fill=tk.X, pady=(0, 8))
-        self._build_toolbar(toolbar)
+        self._build_path_row(topbar)
+        self._build_toolbar(topbar)
 
         # Bottom: status bar. This is packed BEFORE the expandable content area
         # so it reserves its natural height first; the PanedWindow above then
@@ -1185,25 +1188,32 @@ class MainWindow:
     def _build_path_row(self, parent: ttk.Frame) -> None:
         """First row: llama.cpp install folder selector.
 
-        Picks the folder that contains llama-server(.exe); persisted to
-        UiState.llama_server_path so the process manager resolves the binary
-        from there. New users must set this before the first launch.
+        Shares ``parent`` (the topbar frame) with the toolbar so the two rows
+        occupy the *same* 6-column grid with identical widths.
         """
-        path_frame = ttk.Frame(parent)
-        path_frame.pack(fill=tk.X, pady=(0, 6))
-
         # Button on the LEFT, labelled "llamacpp path" (user-facing).
-        sel_btn = ttk.Button(path_frame, text="llamacpp path",
-                             command=self._select_llamacpp_path)
-        sel_btn.pack(side=tk.LEFT, padx=(0, 6))
+        # Explicit TButton style so it matches the toolbar buttons (not Accent).
+        sel_btn = ttk.Button(parent, text="llamacpp path",
+                             command=self._select_llamacpp_path,
+                             style="TButton")
+        sel_btn.grid(row=0, column=0, sticky=tk.EW, padx=(0, 4), pady=(0, 6))
 
         self._llamacpp_path_var = tk.StringVar(
             value=self.store.get_ui_state().llama_server_path or "")
         self._llamacpp_path_label = ttk.Label(
-            path_frame, textvariable=self._llamacpp_path_var,
+            parent, textvariable=self._llamacpp_path_var,
             style="Dim.TLabel", anchor=tk.W)
-        self._llamacpp_path_label.pack(side=tk.LEFT, fill=tk.X, expand=True,
-                                        padx=(0, 6))
+        self._llamacpp_path_label.grid(row=0, column=1, columnspan=4,
+                                       sticky=tk.EW, padx=(4, 4), pady=(0, 6))
+
+        # Agent Launch button — rightmost on the same row as llamacpp path
+        # (the former Hermes button position). Explicit TButton style so it
+        # matches the regular toolbar buttons.
+        self._toolbar_agent_btn = ttk.Button(
+            parent, text="Agent Launch", command=self._open_agent_manager,
+            style="TButton")
+        self._toolbar_agent_btn.grid(row=0, column=5, sticky=tk.EW,
+                                     padx=(4, 0), pady=(0, 6))
 
         self._refresh_llamacpp_path_display()
 
@@ -1236,43 +1246,36 @@ class MainWindow:
             f"folder when launching.")
 
     def _build_toolbar(self, parent: ttk.Frame) -> None:
-        """Build the top toolbar: all controls on a single row.
+        """Build the second row of the topbar (row=1).
 
-        Buttons distributed evenly across the window width; each picks up a
-        share of the available horizontal space (sticky=EW).
+        Shares ``parent`` with ``_build_path_row``; columns are already
+        configured with ``uniform="topbar"`` so widths match row 0 exactly.
         """
-        # 7 equal columns so every toolbar button is exactly the same width:
-        # Add model · Remove model · Stop · Restart · Smoke Test · Start · Agent
-        for i in range(7):
-            parent.columnconfigure(i, weight=1)
-
+        # 6 equal columns so every toolbar button is exactly the same width:
+        # Add model · Remove model · Stop · Restart · Smoke Test · Start
         browse_btn = ttk.Button(parent, text="Add model",
                                 command=self._browse_model)
-        browse_btn.grid(row=0, column=0, sticky=tk.EW, padx=(0, 4))
+        browse_btn.grid(row=1, column=0, sticky=tk.EW, padx=(0, 4))
 
         remove_btn = ttk.Button(parent, text="Remove model",
                                 command=self._remove_selected_model)
-        remove_btn.grid(row=0, column=1, sticky=tk.EW, padx=(4, 4))
+        remove_btn.grid(row=1, column=1, sticky=tk.EW, padx=(4, 4))
 
         self._toolbar_stop_btn = ttk.Button(
             parent, text="Stop Server", command=self._on_stop, state=tk.DISABLED)
-        self._toolbar_stop_btn.grid(row=0, column=2, sticky=tk.EW, padx=(4, 4))
+        self._toolbar_stop_btn.grid(row=1, column=2, sticky=tk.EW, padx=(4, 4))
 
         self._toolbar_restart_btn = ttk.Button(
             parent, text="Restart Server", command=self._on_restart, state=tk.DISABLED)
-        self._toolbar_restart_btn.grid(row=0, column=3, sticky=tk.EW, padx=(4, 4))
+        self._toolbar_restart_btn.grid(row=1, column=3, sticky=tk.EW, padx=(4, 4))
 
         self._toolbar_smoke_btn = ttk.Button(
             parent, text="Smoke Test", command=self._on_smoke_test)
-        self._toolbar_smoke_btn.grid(row=0, column=4, sticky=tk.EW, padx=(4, 4))
+        self._toolbar_smoke_btn.grid(row=1, column=4, sticky=tk.EW, padx=(4, 4))
 
         self._toolbar_start_btn = ttk.Button(parent, text="Start Server", command=self._on_start,
                                              style="Accent.TButton")
-        self._toolbar_start_btn.grid(row=0, column=5, sticky=tk.EW, padx=(4, 0))
-
-        self._toolbar_agent_btn = ttk.Button(
-            parent, text="Agent", command=self._open_agent_manager)
-        self._toolbar_agent_btn.grid(row=0, column=6, sticky=tk.EW, padx=(4, 0))
+        self._toolbar_start_btn.grid(row=1, column=5, sticky=tk.EW, padx=(4, 0))
 
     def _set_toolbar_running(self, running: bool) -> None:
         """Toggle Start/Stop/Restart button states in the toolbar."""

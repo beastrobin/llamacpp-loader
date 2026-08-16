@@ -513,7 +513,9 @@ class ConfigStore:
             valid_keys = UiState.__dataclass_fields__
             self._ui_state = UiState(**{k: v for k, v in ui_data.items() if k in valid_keys})
 
-        # Load external agents (generic launcher targets).
+        # Load external agents (generic launcher targets).  Disk is authoritative;
+        # if the key is missing or not a list, default to an empty list (no
+        # presets shipped in code — users configure their own agents locally).
         agents_raw = raw.get("agents")
         if isinstance(agents_raw, list):
             self._agents = agents_raw
