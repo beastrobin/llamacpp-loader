@@ -35,7 +35,9 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import socket
+import subprocess
 import threading
 import time
 import tkinter as tk
@@ -1217,9 +1219,9 @@ class MainWindow:
         Buttons distributed evenly across the window width; each picks up a
         share of the available horizontal space (sticky=EW).
         """
-        # 6 equal columns so every toolbar button is exactly the same width:
-        # Add model · Remove model · Stop · Restart · Smoke Test · Start
-        for i in range(6):
+        # 7 equal columns so every toolbar button is exactly the same width:
+        # Add model · Remove model · Stop · Restart · Smoke Test · Start · Agent
+        for i in range(7):
             parent.columnconfigure(i, weight=1)
 
         browse_btn = ttk.Button(parent, text="Add model",
@@ -1245,6 +1247,10 @@ class MainWindow:
         self._toolbar_start_btn = ttk.Button(parent, text="Start Server", command=self._on_start,
                                              style="Accent.TButton")
         self._toolbar_start_btn.grid(row=0, column=5, sticky=tk.EW, padx=(4, 0))
+
+        self._toolbar_agent_btn = ttk.Button(
+            parent, text="Agent", command=self._open_agent_manager)
+        self._toolbar_agent_btn.grid(row=0, column=6, sticky=tk.EW, padx=(4, 0))
 
     def _set_toolbar_running(self, running: bool) -> None:
         """Toggle Start/Stop/Restart button states in the toolbar."""
@@ -1955,6 +1961,274 @@ class MainWindow:
                 return True
         except OSError:
             return False
+
+    # ------------------------------------------------------------------ external agent launcher
+    @staticmethod
+    def _resolve_agent_command(command: str) -> Optional[str]:
+        """Resolve an agent command to a launchable path.
+
+        Accepts a bare program name (resolved via PATH, e.g. ``"hermes"``) or an
+        absolute/relative file path.  Returns the resolved command or None.
+        """
+        if not command:
+            return None
+        if os.path.isfile(command):
+            return command
+        found = shutil.which(command)
+        if found:
+            return found
+        # Keep the original token: it may resolve at launch time (e.g. a name
+        # only on PATH after the user's shell loads), and the caller shows a
+        # clear error if it still can't be found.
+        return command
+
+    def _on_launch_agent(self, cfg: dict) -> None:
+        """Launch a configured external agent in its own process.
+
+        *cfg* keys: name, command, args (list[str]), cwd, requires_server
+        (bool), server_port (int), window ("console"|"hidden"|"normal").
+        """
+        name = cfg.get("name") or "Agent"
+        command = (cfg.get("command") or "").strip()
+        if not command:
+            messagebox.showerror(f"{name}: missing command",
+                                 "This agent has no command configured.")
+            return
+
+        # Optional pre-flight: require a local llama-server on a specific port.
+        if cfg.get("requires_server"):
+            port = int(cfg.get("server_port") or 8080)
+            if not self._port_in_use("127.0.0.1", port):
+                if self.proc_mgr.is_running():
+                    running_port = getattr(self, "_active_port", "unknown")
+                    self._status_bar.set_state(
+                        "error", f"{name} needs :{port}, server on :{running_port}")
+                    messagebox.showerror(
+                        f"{name} needs port {port}",
+                        f"{name} is configured to talk to a llama-server on port {port},\n"
+                        f"but the running server is on port {running_port}.\n\n"
+                        "Restart the server on the expected port, then launch again.")
+                    return
+                if not messagebox.askyesno(
+                        "Start server first?",
+                        f"{name} needs a llama-server listening on port {port}.\n\n"
+                        "No server is detected on that port. Start the currently "
+                        "selected model now, then click Launch again once the "
+                        "StatusBar shows 'Server ready'? "):
+                    return
+                self._on_start()
+                self._status_bar.set_state(
+                    "running", "Server starting - click Launch again when ready")
+                messagebox.showinfo(
+                    "Server starting",
+                    "The selected model server is starting.\n\n"
+                    "Wait until the StatusBar shows 'Server ready', then launch "
+                    f"{name} again.")
+                return
+
+        resolved = self._resolve_agent_command(command)
+        if resolved is None:
+            messagebox.showerror(f"{name} not found",
+                                 f"Could not locate the command for {name}:\n\n{command}")
+            return
+
+        args: list[str] = [resolved]
+        for a in cfg.get("args") or []:
+            a = str(a).strip()
+            if a:
+                args.append(a)
+        cwd = (cfg.get("cwd") or "").strip() or None
+
+        window = (cfg.get("window") or "console").lower()
+        try:
+            if os.name == "nt":
+                CREATE_NEW_CONSOLE = 0x00000010
+                CREATE_NO_WINDOW = 0x08000000
+                if window == "hidden":
+                    subprocess.Popen(args, cwd=cwd, creationflags=CREATE_NO_WINDOW)
+                else:  # console / normal -> dedicated window
+                    subprocess.Popen(args, cwd=cwd, creationflags=CREATE_NEW_CONSOLE)
+            else:
+                if window == "hidden":
+                    subprocess.Popen(
+                        args, cwd=cwd,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        stdin=subprocess.DEVNULL)
+                else:
+                    subprocess.Popen(args, cwd=cwd)
+            self._status_bar.set_state(
+                "running",
+                f"{name} launched"
+                + (" (background)" if window == "hidden" else " (separate window)"))
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror(f"Failed to launch {name}", str(exc))
+
+    # ------------------------------------------------------------------ agent manager UI
+    def _open_agent_manager(self) -> None:
+        """Open a dialog to add / edit / remove / launch external agents."""
+        win = tk.Toplevel(self.root)
+        win.title("External Agents")
+        win.geometry("680x460")
+        win.transient(self.root)
+        win.grab_set()
+
+        agents: list[dict] = list(self.store.get_agents())
+        selected = {"idx": None}
+
+        # --- left: list ---
+        left = ttk.Frame(win)
+        left.pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=8)
+        ttk.Label(left, text="Agents").pack(anchor=tk.W)
+        listbox = tk.Listbox(left, width=20, height=22)
+        listbox.pack(fill=tk.Y, expand=True)
+
+        def refresh_list() -> None:
+            listbox.delete(0, tk.END)
+            for a in agents:
+                listbox.insert(tk.END, a.get("name") or "(unnamed)")
+
+        refresh_list()
+
+        # --- right: editor ---
+        right = ttk.Frame(win)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
+        right.columnconfigure(1, weight=1)
+
+        v_name = tk.StringVar()
+        v_command = tk.StringVar()
+        v_args = tk.StringVar()
+        v_cwd = tk.StringVar()
+        v_req = tk.BooleanVar()
+        v_port = tk.StringVar(value="8080")
+        v_window = tk.StringVar(value="console")
+
+        def browse_command() -> None:
+            p = filedialog.askopenfilename(
+                title="Select agent executable",
+                initialdir=self.store.get_ui_state().last_browse_dir or "",
+                filetypes=[("Executable", "*.exe;*.bat;*.cmd;*.py;*.ps1"),
+                           ("All files", "*.*")])
+            if p:
+                v_command.set(p)
+                self.store.set_ui_state(last_browse_dir=str(Path(p).parent))
+
+        def browse_cwd() -> None:
+            d = filedialog.askdirectory(
+                title="Select working directory",
+                initialdir=v_cwd.get() or self.store.get_ui_state().last_browse_dir or "")
+            if d:
+                v_cwd.set(d)
+
+        row = 0
+        ttk.Label(right, text="Name").grid(row=row, column=0, sticky=tk.W, pady=2)
+        ttk.Entry(right, textvariable=v_name, width=40).grid(
+            row=row, column=1, sticky=tk.EW, pady=2); row += 1
+
+        ttk.Label(right, text="Command / exe").grid(row=row, column=0, sticky=tk.W, pady=2)
+        fcmd = ttk.Frame(right)
+        fcmd.grid(row=row, column=1, sticky=tk.EW, pady=2)
+        ttk.Entry(fcmd, textvariable=v_command, width=34).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(fcmd, text="…", width=3, command=browse_command).pack(side=tk.LEFT); row += 1
+
+        ttk.Label(right, text="Args (space-sep)").grid(row=row, column=0, sticky=tk.W, pady=2)
+        ttk.Entry(right, textvariable=v_args, width=40).grid(
+            row=row, column=1, sticky=tk.EW, pady=2); row += 1
+
+        ttk.Label(right, text="Working dir").grid(row=row, column=0, sticky=tk.W, pady=2)
+        fcwd = ttk.Frame(right)
+        fcwd.grid(row=row, column=1, sticky=tk.EW, pady=2)
+        ttk.Entry(fcwd, textvariable=v_cwd, width=34).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(fcwd, text="…", width=3, command=browse_cwd).pack(side=tk.LEFT); row += 1
+
+        ttk.Checkbutton(right, text="Requires local llama-server",
+                        variable=v_req).grid(row=row, column=0, columnspan=2,
+                                             sticky=tk.W, pady=2); row += 1
+
+        ttk.Label(right, text="Server port").grid(row=row, column=0, sticky=tk.W, pady=2)
+        ttk.Entry(right, textvariable=v_port, width=10).grid(
+            row=row, column=1, sticky=tk.W, pady=2); row += 1
+
+        ttk.Label(right, text="Window").grid(row=row, column=0, sticky=tk.W, pady=2)
+        ttk.Combobox(right, textvariable=v_window,
+                     values=["console", "hidden", "normal"],
+                     width=10, state="readonly").grid(
+            row=row, column=1, sticky=tk.W, pady=2); row += 1
+
+        def _agent_from_form() -> dict:
+            try:
+                port = int(v_port.get() or 8080)
+            except ValueError:
+                port = 8080
+            return {
+                "name": v_name.get().strip() or "Agent",
+                "command": v_command.get().strip(),
+                "args": v_args.get().split(),
+                "cwd": v_cwd.get().strip(),
+                "requires_server": bool(v_req.get()),
+                "server_port": port,
+                "window": v_window.get(),
+            }
+
+        def load_selected(event=None) -> None:
+            sel = listbox.curselection()
+            if not sel:
+                return
+            i = sel[0]
+            selected["idx"] = i
+            a = agents[i]
+            v_name.set(a.get("name", ""))
+            v_command.set(a.get("command", ""))
+            v_args.set(" ".join(str(x) for x in a.get("args", [])))
+            v_cwd.set(a.get("cwd", ""))
+            v_req.set(bool(a.get("requires_server", False)))
+            v_port.set(str(a.get("server_port", 8080)))
+            v_window.set(a.get("window", "console"))
+
+        def save_current() -> None:
+            i = selected["idx"]
+            if i is None:
+                messagebox.showwarning("No selection",
+                                       "Select an agent to save, or click Add.")
+                return
+            agents[i] = _agent_from_form()
+            self.store.replace_agents(agents)
+            refresh_list()
+            listbox.selection_set(i)
+
+        def add_new() -> None:
+            agents.append({"name": "New Agent", "command": "", "args": [],
+                           "cwd": "", "requires_server": False,
+                           "server_port": 8080, "window": "console"})
+            refresh_list()
+            listbox.selection_set(len(agents) - 1)
+            load_selected()
+
+        def delete_current() -> None:
+            i = selected["idx"]
+            if i is None:
+                return
+            agents.pop(i)
+            self.store.replace_agents(agents)
+            selected["idx"] = None
+            refresh_list()
+
+        def launch_current() -> None:
+            i = selected["idx"]
+            if i is None:
+                messagebox.showwarning("No selection",
+                                       "Select an agent to launch.")
+                return
+            self._on_launch_agent(agents[i])
+
+        btns = ttk.Frame(right)
+        btns.grid(row=row, column=0, columnspan=2, sticky=tk.W, pady=10)
+        ttk.Button(btns, text="Add", command=add_new).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btns, text="Delete", command=delete_current).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btns, text="Save", command=save_current).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btns, text="Launch", command=launch_current).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btns, text="Close", command=win.destroy).pack(side=tk.LEFT, padx=2)
+
+        listbox.bind("<<ListboxSelect>>", load_selected)
 
     def _do_start_profile(self, profile: ModelProfile) -> bool:
         """Launch the server for *profile* and update the UI.
