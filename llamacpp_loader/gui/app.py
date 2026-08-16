@@ -139,12 +139,34 @@ class MainWindow:
         self._restore_sort_state()
         self._refresh_profile_list()
 
+        # Adopt a server left running by a previous loader session so it is
+        # not orphaned and the Stop button works. See ProcessManager.recover().
+        self._recover_existing_server()
+
     def _on_server_log(self, line: str) -> None:
         """Callback invoked by ProcessManager when a new log line arrives.
 
         Thread-safe: uses root.after() to schedule on the main thread.
         """
         self.root.after(0, lambda: self._console_panel.append_line(line))
+
+    def _recover_existing_server(self) -> None:
+        """Take ownership of a server a previous loader session left running.
+
+        If ProcessManager.recover() finds a live server in its on-disk
+        registry, reflect that in the UI (enable Stop, mark running) and tell
+        the user. Without this, the orphaned server could not be stopped from
+        the new session.
+        """
+        pid = self.proc_mgr.recover()
+        if pid is None:
+            return
+        self._set_toolbar_running(True)
+        self._status_bar.set_state(
+            "running",
+            f"已接管上次会话遗留的 server (PID {pid})，可点 Stop 停止")
+        self._console_panel.append_line(
+            f"[LOADER] 已接管上次会话遗留的 server (PID {pid})，点 Stop 即可关闭它。")
 
     def _build_ui(self) -> None:
         """Build all widgets and lay them out."""

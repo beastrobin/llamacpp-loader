@@ -6,10 +6,14 @@ graceful shutdown, crash-restart, and automatic browser launch on successful sta
 
 from __future__ import annotations
 
+import ctypes
+import json
 import logging
 import os
 import platform
+import signal
 import subprocess
+import tempfile
 import threading
 import time
 import webbrowser
@@ -265,15 +269,37 @@ class ProcessManager:
         # and mark the process RUNNING so the watcher's auto-restart branch
         # (which only fires for state == RUNNING) can actually trigger.
         self._last_config = sc
+
+        # Persist ownership to disk so a later loader session can adopt and
+        # stop this server after this GUI exits. Previously the in-memory
+        # Popen handle was the *only* record of the child process, so closing
+        # and reopening the loader orphaned the server (could not be stopped,
+        # and a second server could be spawned on top of it).
+        try:
+            write_registry(
+                self._process.pid,
+                sc.host,
+                sc.port,
+                self._cached_server_path or "",
+                sc.model_path or "",
+            )
+        except Exception as exc:  # registry is best-effort; never block start
+            logger.warning("Failed to write server registry: %s", exc)
+
         self._set_state(ProcessState.RUNNING)
         return True
 
     def stop(self, grace_period: float = 5.0) -> bool:
         """Gracefully stop the server.
 
-        Sends SIGTERM (or terminate on Windows); waits up to ``grace_period`` seconds.
-        On timeout, sends SIGKILL/force-terminate.
-        Sets internal state to STOPPING then IDLE or ERROR.
+        Sends SIGTERM/terminate(); waits up to ``grace_period`` seconds. On
+        timeout, force-kills.
+
+        If this session holds no in-memory process handle (e.g. a previous
+        loader session launched the server and we adopted it from the on-disk
+        PID registry at startup, or this session never started one), we fall
+        back to killing by PID so a lingering server is still stopped instead
+        of being orphaned.
         """
         self._set_state(ProcessState.STOPPING)
         self._forward_log("Stopping server...")
@@ -282,11 +308,16 @@ class ProcessManager:
             proc = self._process
 
         if proc is None:
-            self._set_state(ProcessState.IDLE)
-            return True
+            # No handle held by this session — try to adopt the server that a
+            # previous session registered, so we can still shut it down.
+            proc = self._adopt_from_registry()
+            if proc is None:
+                self._forward_log("No server handle or registry entry found.")
+                self._set_state(ProcessState.IDLE)
+                return True
 
         try:
-            proc.terminate()  # SIGTERM on Unix, terminate() on Windows
+            proc.terminate()  # SIGTERM on Unix, TerminateProcess on Windows
             try:
                 proc.wait(timeout=grace_period)
                 self._forward_log("Server stopped gracefully.")
@@ -294,8 +325,11 @@ class ProcessManager:
                 return True
             except subprocess.TimeoutExpired:
                 self._forward_log(f"Grace period exceeded ({grace_period}s), forcing kill...")
-                proc.kill()  # SIGKILL
-                proc.wait(timeout=2.0)
+                proc.kill()  # SIGKILL / TerminateProcess
+                try:
+                    proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    self._forward_log("Force kill did not terminate the process.")
                 self._set_state(ProcessState.IDLE)
                 return False
         except OSError as exc:
@@ -303,6 +337,50 @@ class ProcessManager:
             if proc.poll() is not None:
                 self._set_state(ProcessState.IDLE)
             return False
+        finally:
+            # Drop the on-disk registry entry once we have acted on the server,
+            # so a future session does not try to adopt a server we've stopped.
+            clear_registry()
+
+    def _adopt_from_registry(self) -> Optional["_PidHandle"]:
+        """Reconnect to a server tracked in the on-disk registry.
+
+        Returns a ``_PidHandle`` if the registered PID is still alive, else
+        ``None`` (and clears a stale registry entry). Used by ``stop()`` when
+        this session holds no real Popen handle.
+        """
+        data = read_registry()
+        if data is None:
+            return None
+        pid = data.get("pid")
+        if pid is None or not _pid_is_llama_server(pid):
+            clear_registry()
+            return None
+        self._forward_log(
+            f"Adopting server from registry (PID {pid}, port {data.get('port')})")
+        return _PidHandle(pid)
+
+    def recover(self) -> Optional[int]:
+        """Adopt a server left running by a previous loader session.
+
+        Called at startup. If the registry points to a live process, this
+        session takes ownership (state RUNNING) so the UI's Stop button works
+        and the server is not orphaned. Returns the adopted PID or ``None``.
+        """
+        data = read_registry()
+        if data is None:
+            return None
+        pid = data.get("pid")
+        if pid is None or not _pid_is_llama_server(pid):
+            clear_registry()
+            return None
+        with self._lock:
+            self._process = _PidHandle(pid)
+        self._set_state(ProcessState.RUNNING)
+        self._forward_log(
+            f"Recovered running server from previous session (PID {pid}, "
+            f"port {data.get('port')})")
+        return pid
 
     def restart(self, config: ServerConfig | ModelProfile = None) -> bool:
         """Stop then start in one atomic operation.
@@ -554,4 +632,185 @@ def _get_model_profile_class():
         from llamacpp_loader.config.store import ModelProfile as _MP
         _ModelProfile = _MP
     return _ModelProfile
+
+
+# --------------------------------------------------------------------------- server registry (on-disk PID file)
+#
+# The in-memory Popen handle is lost whenever the loader GUI exits, which
+# previously left a launched llama-server orphaned (un-stoppable, and a second
+# server could be spawned on top of it). We persist ownership to a small JSON
+# file so *any* loader session can adopt and stop the server by PID.
+
+def _registry_path() -> Path:
+    """Location of the on-disk server PID registry."""
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or tempfile.gettempdir()
+        directory = Path(base) / "llamacpp-loader"
+    else:
+        directory = Path.home() / ".config" / "llamacpp-loader"
+    return directory / "server.pid"
+
+
+def write_registry(pid: int, host: str, port: int, exe: str, model: str = "") -> None:
+    """Record the running server's PID and metadata to disk."""
+    path = _registry_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "pid": pid,
+        "host": host,
+        "port": port,
+        "exe": exe,
+        "model": model,
+        "started_at": time.time(),
+    }
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def read_registry() -> Optional[dict]:
+    """Read the server registry, or ``None`` if absent/corrupt."""
+    path = _registry_path()
+    if not path.is_file():
+        return None
+    try:
+        raw = path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or "pid" not in data:
+        return None
+    return data
+
+
+def clear_registry() -> None:
+    """Remove the server registry file (best-effort)."""
+    try:
+        _registry_path().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _pid_alive(pid: int) -> bool:
+    """Return ``True`` if a process with *pid* is currently running."""
+    if os.name == "nt":
+        try:
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        except AttributeError:
+            return False
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_ulong()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                # STILL_ACTIVE == 259
+                return exit_code.value == 0x103
+            return False
+        finally:
+            kernel32.CloseHandle(handle)
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+
+def _kill_pid(pid: int) -> None:
+    """Terminate the process with *pid* (best-effort, cross-platform)."""
+    if os.name == "nt":
+        try:
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        except AttributeError:
+            return
+        PROCESS_TERMINATE = 0x0001
+        handle = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+        if handle:
+            kernel32.TerminateProcess(handle, 0)
+            kernel32.CloseHandle(handle)
+    else:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+
+def _pid_image_name(pid: int) -> Optional[str]:
+    """Return the executable image path of *pid*, or ``None`` if unavailable."""
+    if os.name == "nt":
+        try:
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        except AttributeError:
+            return None
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return None
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            size = ctypes.c_ulong(1024)
+            if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                return buf.value
+            return None
+        finally:
+            kernel32.CloseHandle(handle)
+    else:
+        try:
+            return os.readlink(f"/proc/{pid}/exe")
+        except OSError:
+            return None
+
+
+def _pid_is_llama_server(pid: int) -> bool:
+    """True if *pid* is alive AND its image name looks like llama-server.
+
+    Guards against PID reuse: a stale registry pointing at a PID that the OS
+    has since reassigned to an unrelated process must not be adopted or killed.
+    """
+    if not _pid_alive(pid):
+        return False
+    name = _pid_image_name(pid)
+    if not name:
+        # Image could not be resolved (e.g. access denied) — trust the PID
+        # check alone rather than refuse to manage a server we likely own.
+        return True
+    base = os.path.basename(name).lower()
+    return "llama-server" in base or "llama_server" in base
+
+
+class _PidHandle:
+    """Minimal ``subprocess.Popen`` stand-in backed by an OS PID.
+
+    Lets a ProcessManager control a server it did not spawn (one adopted from
+    the on-disk registry). Only the subset of the Popen interface used by
+    stop()/is_running()/get_pid() is implemented.
+    """
+
+    def __init__(self, pid: int):
+        self.pid = pid
+        self.stdout = None  # no pipe to read from
+        self.returncode: Optional[int] = None
+
+    def poll(self) -> Optional[int]:
+        return None if _pid_alive(self.pid) else 0
+
+    def terminate(self) -> None:
+        _kill_pid(self.pid)
+
+    def kill(self) -> None:
+        _kill_pid(self.pid)
+
+    def wait(self, timeout: Optional[float] = None) -> int:
+        if timeout is None:
+            while _pid_alive(self.pid):
+                time.sleep(0.1)
+            self.returncode = 0
+            return 0
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not _pid_alive(self.pid):
+                self.returncode = 0
+                return 0
+            time.sleep(0.1)
+        raise subprocess.TimeoutExpired(self.pid, timeout)
 
