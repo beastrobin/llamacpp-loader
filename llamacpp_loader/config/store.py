@@ -716,6 +716,21 @@ class ConfigStore:
         with self._lock:
             return self._agents
 
+    def get_default_agent(self) -> Optional[dict]:
+        """Return the agent marked ``is_default`` (or the first one if none).
+
+        Used by the one-click Agent Launch button so the user can pick a
+        default in the settings dialog instead of launching from the list
+        every time.
+        """
+        with self._lock:
+            if not self._agents:
+                return None
+            for a in self._agents:
+                if a.get("is_default"):
+                    return dict(a)
+            return dict(self._agents[0])
+
     def replace_agents(self, agents: list[dict]) -> None:
         """Replace the whole agent list and persist atomically.
 

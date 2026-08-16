@@ -1186,10 +1186,12 @@ class MainWindow:
         self._refresh_changed_overlays()
 
     def _build_path_row(self, parent: ttk.Frame) -> None:
-        """First row: llama.cpp install folder selector.
+        """First row: llama.cpp install folder selector + agent buttons.
 
         Shares ``parent`` (the topbar frame) with the toolbar so the two rows
-        occupy the *same* 6-column grid with identical widths.
+        occupy the *same* 6-column grid with identical widths:
+        col0 = llamacpp path btn, col1-3 = path label, col4 = Agent Settings,
+        col5 = Agent Launch (rightmost).
         """
         # Button on the LEFT, labelled "llamacpp path" (user-facing).
         # Explicit TButton style so it matches the toolbar buttons (not Accent).
@@ -1203,14 +1205,21 @@ class MainWindow:
         self._llamacpp_path_label = ttk.Label(
             parent, textvariable=self._llamacpp_path_var,
             style="Dim.TLabel", anchor=tk.W)
-        self._llamacpp_path_label.grid(row=0, column=1, columnspan=4,
+        self._llamacpp_path_label.grid(row=0, column=1, columnspan=3,
                                        sticky=tk.EW, padx=(4, 4), pady=(0, 6))
 
-        # Agent Launch button — rightmost on the same row as llamacpp path
-        # (the former Hermes button position). Explicit TButton style so it
-        # matches the regular toolbar buttons.
+        # Agent Settings — opens the management dialog (add/edit/remove/
+        # pick default).
+        self._toolbar_agent_settings_btn = ttk.Button(
+            parent, text="Agent Settings", command=self._open_agent_manager,
+            style="TButton")
+        self._toolbar_agent_settings_btn.grid(row=0, column=4, sticky=tk.EW,
+                                              padx=(4, 4), pady=(0, 6))
+
+        # Agent Launch — one-click launch of the default agent (no dialog).
+        # Explicit TButton style so it matches the regular toolbar buttons.
         self._toolbar_agent_btn = ttk.Button(
-            parent, text="Agent Launch", command=self._open_agent_manager,
+            parent, text="Agent Launch", command=self._on_launch_default_agent,
             style="TButton")
         self._toolbar_agent_btn.grid(row=0, column=5, sticky=tk.EW,
                                      padx=(4, 0), pady=(0, 6))
@@ -2111,6 +2120,28 @@ class MainWindow:
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror(f"Failed to launch {name}", str(exc))
 
+    def _on_launch_default_agent(self) -> None:
+        """One-click launch of the default agent (no dialog).
+
+        Picks the agent marked ``is_default`` in the settings (falling back
+        to the first configured agent).  If none are configured, points the
+        user to Agent Settings.
+        """
+        agent = self.store.get_default_agent()
+        if agent is None:
+            messagebox.showinfo(
+                "No agents configured",
+                "No external agents are configured yet.\n\n"
+                "Open Agent Settings to add one (e.g. Hermes).")
+            return
+        if not (agent.get("command") or "").strip():
+            messagebox.showwarning(
+                "Default agent incomplete",
+                f"The default agent '{agent.get('name')}' has no command "
+                "configured.\n\nOpen Agent Settings to fix it.")
+            return
+        self._on_launch_agent(agent)
+
     # ------------------------------------------------------------------ agent manager UI
     def _open_agent_manager(self) -> None:
         """Open a dialog to add / edit / remove / launch external agents."""
@@ -2133,7 +2164,10 @@ class MainWindow:
         def refresh_list() -> None:
             listbox.delete(0, tk.END)
             for a in agents:
-                listbox.insert(tk.END, a.get("name") or "(unnamed)")
+                label = a.get("name") or "(unnamed)"
+                if a.get("is_default"):
+                    label = f"★ {label}"
+                listbox.insert(tk.END, label)
 
         refresh_list()
 
@@ -2215,6 +2249,8 @@ class MainWindow:
                 "requires_server": bool(v_req.get()),
                 "server_port": port,
                 "window": v_window.get(),
+                "is_default": bool(agents[selected["idx"]].get("is_default"))
+                if selected["idx"] is not None else False,
             }
 
         def load_selected(event=None) -> None:
@@ -2246,7 +2282,8 @@ class MainWindow:
         def add_new() -> None:
             agents.append({"name": "New Agent", "command": "", "args": [],
                            "cwd": "", "requires_server": False,
-                           "server_port": 8080, "window": "console"})
+                           "server_port": 8080, "window": "console",
+                           "is_default": False})
             refresh_list()
             listbox.selection_set(len(agents) - 1)
             load_selected()
@@ -2260,6 +2297,19 @@ class MainWindow:
             selected["idx"] = None
             refresh_list()
 
+        def set_default() -> None:
+            """Mark the selected agent as the one-click default."""
+            i = selected["idx"]
+            if i is None:
+                messagebox.showwarning("No selection",
+                                       "Select an agent to set as default.")
+                return
+            for a in agents:
+                a["is_default"] = (a is agents[i])
+            self.store.replace_agents(agents)
+            refresh_list()
+            listbox.selection_set(i)
+
         def launch_current() -> None:
             i = selected["idx"]
             if i is None:
@@ -2272,6 +2322,7 @@ class MainWindow:
         btns.grid(row=row, column=0, columnspan=2, sticky=tk.W, pady=10)
         ttk.Button(btns, text="Add", command=add_new).pack(side=tk.LEFT, padx=2)
         ttk.Button(btns, text="Delete", command=delete_current).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btns, text="Set Default", command=set_default).pack(side=tk.LEFT, padx=2)
         ttk.Button(btns, text="Save", command=save_current).pack(side=tk.LEFT, padx=2)
         ttk.Button(btns, text="Launch", command=launch_current).pack(side=tk.LEFT, padx=2)
         ttk.Button(btns, text="Close", command=win.destroy).pack(side=tk.LEFT, padx=2)
