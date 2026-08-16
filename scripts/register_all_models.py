@@ -49,7 +49,9 @@ CTX_MAX = 262144         # 256K absolute ceiling on 24 GB (verified 35B hits it)
 # More specific families should come first.
 MMPROJ = [
     ("qwen3.6-35b-a3b", r"models\HauhauCS\mmproj-Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-f16.gguf"),
-    ("gemma-4-26b-a4b", r"models\google\mmproj-gemma-4-12B-it-QAT-BF16.gguf"),
+    # NOTE: gemma-4-26b-a4b has no official mmproj on disk yet (the 12B
+    # projector is dimension-incompatible), so it is intentionally omitted here
+    # and launches as a text-only model until a correct 26B projector is added.
     ("gemma-4-12b", r"models\google\mmproj-gemma-4-12B-it-QAT-BF16.gguf"),
 ]
 
@@ -240,7 +242,11 @@ def main() -> None:
             if fam in stem.lower():
                 mp = bin_path / rel
                 if mp.is_file():
-                    extra.append(mp.name)
+                    # Store the ABSOLUTE path (not just the filename) so the
+                    # manager resolves it correctly no matter which directory the
+                    # main model lives in — a bare name would be joined onto the
+                    # model dir and silently fail to resolve.
+                    extra.append(str(mp))
                     break
 
         # Autonomous capability detection (MoE / MTP support) + MTP draft pairing.
