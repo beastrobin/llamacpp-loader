@@ -754,9 +754,13 @@ class MainWindow:
         profile = self.store.load(name)
         if not profile:
             return
-        # Replace first extra file with the chosen vision model
+        # Replace first extra file with the chosen vision model.
+        # Store the FULL absolute path so the mmproj can live anywhere
+        # (e.g. a shared mmproj dir) instead of being force-copied next to
+        # every main model — os.path.join(model_path, abs_path) keeps the
+        # absolute path, so launch still resolves it correctly.
         extra = [f for f in profile.extra_files if "mmproj" not in f.lower()]
-        extra.insert(0, p.name)
+        extra.insert(0, str(p))
         self.store.update(name, {"extra_files": extra})
         self._refresh_model_table(self.store.list_profiles())
 
@@ -816,7 +820,9 @@ class MainWindow:
             return
         p = Path(path)
         self.store.set_ui_state(last_browse_dir=str(p.parent))
-        updates = {"mtp_model": p.name, "mtp_enabled": True}
+        # Store the FULL absolute path so the MTP draft can live anywhere
+        # instead of being force-copied next to every main model.
+        updates = {"mtp_model": str(p), "mtp_enabled": True}
         self.store.update(name, updates)
         self._refresh_model_table(self.store.list_profiles())
 
@@ -1823,7 +1829,9 @@ class MainWindow:
         display_name = main_path.stem
 
         existing_profile = self.store.load(profile_name)
-        extra_files = [str(p.name) for p in extra_paths]
+        # Store absolute paths for extra files (e.g. mmproj) so they resolve
+        # correctly wherever they live, not only beside the main model.
+        extra_files = [str(p) for p in extra_paths]
 
         if existing_profile:
             existing_profile.model_path = str(main_path.parent)
