@@ -2067,12 +2067,25 @@ class MainWindow:
         window = (cfg.get("window") or "console").lower()
         try:
             if os.name == "nt":
-                CREATE_NEW_CONSOLE = 0x00000010
                 CREATE_NO_WINDOW = 0x08000000
                 if window == "hidden":
                     subprocess.Popen(args, cwd=cwd, creationflags=CREATE_NO_WINDOW)
-                else:  # console / normal -> dedicated window
-                    subprocess.Popen(args, cwd=cwd, creationflags=CREATE_NEW_CONSOLE)
+                else:
+                    # TUI agents (e.g. Hermes REPL) need a *real* console with
+                    # tty stdio.  A bare CREATE_NEW_CONSOLE Popen from a
+                    # pythonw parent inherits pipe stdio (GetStdHandle is NULL
+                    # -> CPython creates anonymous pipes), so prompt_toolkit /
+                    # rich detect no tty and the app exits instantly ("flash
+                    # and quit").  Wrapping with `cmd /c start` gives the
+                    # child its own console window with real tty stdio.
+                    #
+                    # NOTE: pass the pieces as separate argv entries so
+                    # list2cmdline quotes them correctly.  Building one big
+                    # "start ..." string and passing it as a single arg makes
+                    # cmd receive "start \"\" C:\..." with nested quotes and
+                    # fail with "Windows cannot find the file".
+                    subprocess.Popen(
+                        ["cmd", "/c", "start", "", *args], cwd=cwd)
             else:
                 if window == "hidden":
                     subprocess.Popen(
