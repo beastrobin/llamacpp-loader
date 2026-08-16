@@ -2064,12 +2064,21 @@ class MainWindow:
                 args.append(a)
         cwd = (cfg.get("cwd") or "").strip() or None
 
+        # Sanitize the child environment: prompt_toolkit / rich TUI apps crash
+        # on Windows with "NoConsoleScreenBufferError: Found xterm-256color"
+        # when TERM/COLORTERM leak in from a Git Bash / WSL parent.  Strip
+        # them so the child sees a plain Windows console.
+        child_env = os.environ.copy()
+        child_env.pop("TERM", None)
+        child_env.pop("COLORTERM", None)
+
         window = (cfg.get("window") or "console").lower()
         try:
             if os.name == "nt":
                 CREATE_NO_WINDOW = 0x08000000
                 if window == "hidden":
-                    subprocess.Popen(args, cwd=cwd, creationflags=CREATE_NO_WINDOW)
+                    subprocess.Popen(args, cwd=cwd, env=child_env,
+                                     creationflags=CREATE_NO_WINDOW)
                 else:
                     # TUI agents (e.g. Hermes REPL) need a *real* console with
                     # tty stdio.  A bare CREATE_NEW_CONSOLE Popen from a
@@ -2085,15 +2094,16 @@ class MainWindow:
                     # cmd receive "start \"\" C:\..." with nested quotes and
                     # fail with "Windows cannot find the file".
                     subprocess.Popen(
-                        ["cmd", "/c", "start", "", *args], cwd=cwd)
+                        ["cmd", "/c", "start", "", *args], cwd=cwd,
+                        env=child_env)
             else:
                 if window == "hidden":
                     subprocess.Popen(
-                        args, cwd=cwd,
+                        args, cwd=cwd, env=child_env,
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                         stdin=subprocess.DEVNULL)
                 else:
-                    subprocess.Popen(args, cwd=cwd)
+                    subprocess.Popen(args, cwd=cwd, env=child_env)
             self._status_bar.set_state(
                 "running",
                 f"{name} launched"
