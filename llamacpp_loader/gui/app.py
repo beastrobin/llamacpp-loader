@@ -1962,6 +1962,11 @@ class MainWindow:
                 wintypes.WPARAM, wintypes.LPARAM,
             ]
             user32.CallWindowProcW.restype = ctypes.c_ssize_t
+            user32.DefWindowProcW.argtypes = [
+                wintypes.HWND, wintypes.UINT,
+                wintypes.WPARAM, wintypes.LPARAM,
+            ]
+            user32.DefWindowProcW.restype = ctypes.c_ssize_t
             shell32.DragQueryFileW.argtypes = [
                 wintypes.HANDLE, wintypes.UINT,
                 wintypes.LPWSTR, wintypes.UINT,
@@ -1982,10 +1987,26 @@ class MainWindow:
             orig_fn = WNDPROC(original_proc)
 
             def _wndproc(hwnd, msg, wparam, lparam):
-                if msg == WM_DROPFILES:
-                    self._on_drop_files(wparam)
-                    return 0
-                return orig_fn(hwnd, msg, wparam, lparam)
+                try:
+                    if msg == WM_DROPFILES:
+                        self._on_drop_files(wparam)
+                        return 0
+                    # Subclassing rule: chain through CallWindowProcW, never
+                    # invoke the previous WndProc pointer directly (x64 stack
+                    # alignment / ABI differences can crash otherwise).
+                    return user32.CallWindowProcW(
+                        orig_fn, hwnd, msg, wparam, lparam)
+                except Exception as exc:  # noqa: BLE001
+                    # CRITICAL: an exception escaping a ctypes WNDPROC callback
+                    # triggers a fast-fail process abort (0xc0000409) with no
+                    # traceback. Swallow everything and defer to the default
+                    # handler so the app never dies from a drop.
+                    logger.warning("WndProc error on msg 0x%x: %s", msg, exc)
+                    try:
+                        return user32.DefWindowProcW(
+                            hwnd, msg, wparam, lparam)
+                    except Exception:  # noqa: BLE001
+                        return 0
 
             new_proc = WNDPROC(_wndproc)
             # Keep the Python callable alive for the lifetime of the window;
@@ -2009,23 +2030,29 @@ class MainWindow:
 
     def _on_drop_files(self, hdrop) -> None:
         """Handle WM_DROPFILES: extract file paths and import GGUF models."""
-        try:
-            import ctypes
-            from ctypes import wintypes
+        import ctypes
+        from ctypes import wintypes
 
-            shell32 = ctypes.windll.shell32
-            hdrop = ctypes.c_void_p(hdrop)
+        shell32 = ctypes.windll.shell32
+        hdrop = ctypes.c_void_p(hdrop)
+        files: list[str] = []
+        try:
             n = shell32.DragQueryFileW(hdrop, 0xFFFFFFFF, None, 0)
-            files: list[str] = []
             for i in range(n):
                 length = shell32.DragQueryFileW(hdrop, i, None, 0)
                 buf = ctypes.create_unicode_buffer(length + 1)
                 shell32.DragQueryFileW(hdrop, i, buf, length + 1)
                 files.append(buf.value)
-            shell32.DragFinish(hdrop)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Drag & drop read failed: %s", exc)
             return
+        finally:
+            # Always release the HDROP, even on partial reads; leaking it
+            # would leak the OLE memory the shell allocated for the drop.
+            try:
+                shell32.DragFinish(hdrop)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("DragFinish: %s", exc)
         if not files:
             return
         # Route through the Tk main loop so widget updates stay on the
@@ -2033,15 +2060,44 @@ class MainWindow:
         self.root.after(0, lambda: self._import_dropped_paths(files))
 
     def _import_dropped_paths(self, files: list[str]) -> None:
-        """Filter dropped paths to .gguf files and import them."""
-        gguf = [f for f in files if f.lower().endswith(".gguf")]
+        """Import dropped .gguf files; directories are scanned recursively.
+
+        A dropped folder is walked for every ``*.gguf`` inside it (one level
+        is not assumed — deep scans are fine since model folders are shallow).
+        Unlike the Browse multi-select (first file = main model, rest =
+        extra_files), each dropped file becomes its own profile; vision
+        ``mmproj``/``clip`` files are skipped since they are attachments, not
+        standalone models.
+        """
+        import os as _os
+
+        gguf: list[str] = []
+        for path in files:
+            if _os.path.isdir(path):
+                for root, _dirs, names in _os.walk(path):
+                    for name in names:
+                        if name.lower().endswith(".gguf"):
+                            gguf.append(_os.path.join(root, name))
+            elif path.lower().endswith(".gguf"):
+                gguf.append(path)
         if not gguf:
             messagebox.showinfo(
                 "No GGUF files",
                 "No .gguf files found in the dropped items.\n\n"
-                "Drag GGUF model files onto this window to add them.")
+                "Drag GGUF model files or a folder containing them "
+                "onto this window to add models.")
             return
-        self._import_gguf_paths(gguf)
+        # Skip vision-projector attachments; import every real model as its
+        # own profile. Sort for a deterministic, repeatable order.
+        models = [f for f in sorted(gguf)
+                  if "mmproj" not in f.lower() and "clip" not in f.lower()]
+        if not models:
+            messagebox.showinfo(
+                "No GGUF models",
+                "The dropped items only contain mmproj/clip attachment files.")
+            return
+        for model in models:
+            self._import_gguf_paths([model])
 
     def _on_profile_selected(self, event=None) -> None:
         """Handler for profile selection change."""
