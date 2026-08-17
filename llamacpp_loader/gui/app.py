@@ -2041,30 +2041,6 @@ class MainWindow:
                     continue
                 self._spawn_sidecar(line)
 
-    def _spawn_sidecar(self, command_line: str) -> None:
-        """Spawn a single sidecar command hidden (detached, no console).
-
-        Sidecars are daemons / short-lived ensure-scripts (e.g. the Hermes
-        gateway), not interactive TUIs, so a hidden Popen is appropriate.
-        The child gets its own process group so it survives the loader.
-        """
-        try:
-            import shlex
-            argv = shlex.split(command_line)
-            if not argv:
-                return
-            kwargs: dict = {"close_fds": True}
-            if os.name == "nt":
-                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-            else:
-                kwargs.update(stdout=subprocess.DEVNULL,
-                              stderr=subprocess.DEVNULL,
-                              stdin=subprocess.DEVNULL,
-                              start_new_session=True)
-            subprocess.Popen(argv, **kwargs)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to spawn sidecar %r: %s", command_line, exc)
-
         # Optional pre-flight: require a local llama-server on a specific port.
         if cfg.get("requires_server"):
             port = int(cfg.get("server_port") or 8080)
@@ -2155,6 +2131,30 @@ class MainWindow:
                 + (" (background)" if window == "hidden" else " (separate window)"))
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror(f"Failed to launch {name}", str(exc))
+
+    def _spawn_sidecar(self, command_line: str) -> None:
+        """Spawn a single sidecar command hidden (detached, no console).
+
+        Sidecars are daemons / short-lived ensure-scripts (e.g. the Hermes
+        gateway), not interactive TUIs, so a hidden Popen is appropriate.
+        The child gets its own process group so it survives the loader.
+        """
+        try:
+            import shlex
+            argv = shlex.split(command_line)
+            if not argv:
+                return
+            kwargs: dict = {"close_fds": True}
+            if os.name == "nt":
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            else:
+                kwargs.update(stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL,
+                              stdin=subprocess.DEVNULL,
+                              start_new_session=True)
+            subprocess.Popen(argv, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to spawn sidecar %r: %s", command_line, exc)
 
     def _on_launch_default_agent(self) -> None:
         """One-click launch of the default agent (no dialog).
