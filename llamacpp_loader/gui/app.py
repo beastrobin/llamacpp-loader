@@ -1923,8 +1923,15 @@ class MainWindow:
     # ---------------------------------------------------------- drag & drop
     # Native Windows OLE file-drop support implemented with ctypes only
     # (no tkinterdnd2 / tkdnd dependency). Tk's window procedure is
-    # subclassed so WM_DROPFILES is routed to _on_drop_files(); the original
+    # subclassed so WM_DROPFILES is routed to a handler; the original
     # WndProc is called for every other message.
+    #
+    # IMPORTANT: the WndProc callback runs on a C message thread and MUST
+    # NOT touch any Tk object (root.after / widgets) — doing so corrupts
+    # the GIL state and crashes the process (fatal PyEval_RestoreThread /
+    # fast-fail 0xc0000409). The callback only extracts the dropped paths
+    # via pure ctypes and appends them to a queue; the Tk main loop drains
+    # the queue via a periodic after() poll.
     _DROP_TARGET_INSTALLED = False
 
     def _install_drop_target(self) -> None:
@@ -1989,7 +1996,7 @@ class MainWindow:
             def _wndproc(hwnd, msg, wparam, lparam):
                 try:
                     if msg == WM_DROPFILES:
-                        self._on_drop_files(wparam)
+                        self._collect_dropped_paths(wparam)
                         return 0
                     # Subclassing rule: chain through CallWindowProcW, never
                     # invoke the previous WndProc pointer directly (x64 stack
@@ -2024,12 +2031,21 @@ class MainWindow:
             except Exception as exc:  # noqa: BLE001
                 logger.debug("DragAcceptFiles: %s", exc)
             self._DROP_TARGET_INSTALLED = True
+            # Queue drained from the Tk main loop (never from the WndProc
+            # callback thread — that would corrupt the GIL and crash).
+            self._pending_drop_paths: list[str] = []
+            self._drop_poll_id = self.root.after(150, self._drain_drop_queue)
             logger.info("Drag & drop enabled: drop .gguf files onto the window")
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to install drag & drop: %s", exc)
 
-    def _on_drop_files(self, hdrop) -> None:
-        """Handle WM_DROPFILES: extract file paths and import GGUF models."""
+    def _collect_dropped_paths(self, hdrop) -> None:
+        """WndProc-side collector: extract paths via ctypes only.
+
+        Runs on the Windows message thread. Must not touch Tk objects or
+        call root.after — it only reads the HDROP and queues the paths;
+        the main loop drains the queue. Any failure is swallowed.
+        """
         import ctypes
         from ctypes import wintypes
 
@@ -2055,9 +2071,28 @@ class MainWindow:
                 logger.debug("DragFinish: %s", exc)
         if not files:
             return
-        # Route through the Tk main loop so widget updates stay on the
-        # GUI thread (WM_DROPFILES may arrive on a non-GUI thread).
-        self.root.after(0, lambda: self._import_dropped_paths(files))
+        try:
+            self._pending_drop_paths.extend(files)
+        except Exception:  # noqa: BLE001
+            logger.warning("Drop queue unavailable")
+
+    def _drain_drop_queue(self) -> None:
+        """Tk-main-thread poller: import any queued dropped paths."""
+        try:
+            pending = list(getattr(self, "_pending_drop_paths", ()))
+            if pending:
+                self._pending_drop_paths.clear()
+                try:
+                    self._import_dropped_paths(pending)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Failed to import dropped paths: %s", exc)
+        finally:
+            # Keep polling while the window lives.
+            try:
+                self._drop_poll_id = self.root.after(
+                    150, self._drain_drop_queue)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _import_dropped_paths(self, files: list[str]) -> None:
         """Import dropped .gguf files; directories are scanned recursively.
