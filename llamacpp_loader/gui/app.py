@@ -2020,7 +2020,10 @@ class MainWindow:
         """Launch a configured external agent in its own process.
 
         *cfg* keys: name, command, args (list[str]), cwd, requires_server
-        (bool), server_port (int), window ("console"|"hidden"|"normal").
+        (bool), server_port (int), window ("console"|"hidden"|"normal"),
+        pre_launch (str) — one command per line; each is spawned hidden
+        (detached) BEFORE the main agent so sidecar daemons (e.g. the
+        Hermes gateway) come up first.
         """
         name = cfg.get("name") or "Agent"
         command = (cfg.get("command") or "").strip()
@@ -2028,6 +2031,39 @@ class MainWindow:
             messagebox.showerror(f"{name}: missing command",
                                  "This agent has no command configured.")
             return
+
+        # Optional sidecar daemons: spawn hidden before the main agent.
+        pre_launch = (cfg.get("pre_launch") or "").strip()
+        if pre_launch:
+            for line in pre_launch.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                self._spawn_sidecar(line)
+
+    def _spawn_sidecar(self, command_line: str) -> None:
+        """Spawn a single sidecar command hidden (detached, no console).
+
+        Sidecars are daemons / short-lived ensure-scripts (e.g. the Hermes
+        gateway), not interactive TUIs, so a hidden Popen is appropriate.
+        The child gets its own process group so it survives the loader.
+        """
+        try:
+            import shlex
+            argv = shlex.split(command_line)
+            if not argv:
+                return
+            kwargs: dict = {"close_fds": True}
+            if os.name == "nt":
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            else:
+                kwargs.update(stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL,
+                              stdin=subprocess.DEVNULL,
+                              start_new_session=True)
+            subprocess.Popen(argv, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to spawn sidecar %r: %s", command_line, exc)
 
         # Optional pre-flight: require a local llama-server on a specific port.
         if cfg.get("requires_server"):
@@ -2183,6 +2219,7 @@ class MainWindow:
         v_req = tk.BooleanVar()
         v_port = tk.StringVar(value="8080")
         v_window = tk.StringVar(value="console")
+        v_pre_launch = tk.StringVar()
 
         def browse_command() -> None:
             p = filedialog.askopenfilename(
@@ -2236,6 +2273,12 @@ class MainWindow:
                      width=10, state="readonly").grid(
             row=row, column=1, sticky=tk.W, pady=2); row += 1
 
+        ttk.Label(right, text="Pre-launch cmds").grid(row=row, column=0, sticky=tk.NW, pady=2)
+        ttk.Entry(right, textvariable=v_pre_launch, width=40).grid(
+            row=row, column=1, sticky=tk.EW, pady=2); row += 1
+        ttk.Label(right, text="(one cmd/line; run hidden before agent)",
+                  foreground="#888").grid(row=row, column=1, sticky=tk.W, pady=(0, 4)); row += 1
+
         def _agent_from_form() -> dict:
             try:
                 port = int(v_port.get() or 8080)
@@ -2249,6 +2292,7 @@ class MainWindow:
                 "requires_server": bool(v_req.get()),
                 "server_port": port,
                 "window": v_window.get(),
+                "pre_launch": v_pre_launch.get().strip(),
                 "is_default": bool(agents[selected["idx"]].get("is_default"))
                 if selected["idx"] is not None else False,
             }
@@ -2267,6 +2311,7 @@ class MainWindow:
             v_req.set(bool(a.get("requires_server", False)))
             v_port.set(str(a.get("server_port", 8080)))
             v_window.set(a.get("window", "console"))
+            v_pre_launch.set(a.get("pre_launch", ""))
 
         def save_current() -> None:
             i = selected["idx"]
@@ -2283,6 +2328,7 @@ class MainWindow:
             agents.append({"name": "New Agent", "command": "", "args": [],
                            "cwd": "", "requires_server": False,
                            "server_port": 8080, "window": "console",
+                           "pre_launch": "",
                            "is_default": False})
             refresh_list()
             listbox.selection_set(len(agents) - 1)
