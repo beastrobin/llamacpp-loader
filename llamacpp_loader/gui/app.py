@@ -145,6 +145,15 @@ class MainWindow:
         # not orphaned and the Stop button works. See ProcessManager.recover().
         self._recover_existing_server()
 
+        # Clean exit on window close: gracefully stop the managed llama-server
+        # (whether spawned by this session or adopted from a previous one) so it
+        # does not linger as an orphan still holding VRAM/RAM after the GUI
+        # exits. This also prevents re-opening the loader from spawning a second
+        # server on top of the first (double VRAM). Registered here -- not in
+        # main.py / create_app -- so it governs BOTH the production entry point
+        # and the test / standalone entry point (both construct MainWindow).
+        self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
+
     def _on_server_log(self, line: str) -> None:
         """Callback invoked by ProcessManager when a new log line arrives.
 
@@ -192,6 +201,27 @@ class MainWindow:
         self._console_panel.append_line(
             f"[LOADER] 已接管正在运行的 llama-server (PID {pid})，模型: {label}。"
             "点 Stop 即可关闭它。")
+
+    def _on_closing(self) -> None:
+        """Window close handler: persist UI state, stop the server, then quit.
+
+        Replaces the previous behaviour where the production entry point
+        (main.py) registered its own ``WM_DELETE_WINDOW`` handler that only
+        saved window state and never stopped the managed llama-server, leaving
+        it running (and holding VRAM/RAM) after the GUI closed. Stopping is
+        wrapped in try/except so a failure can never block the window from
+        closing -- the GUI must always be able to exit.
+        """
+        logger.info("App closing — saving window state and stopping server")
+        try:
+            self.save_window_state()
+        except Exception as exc:  # never block close on save failure
+            logger.warning("save_window_state failed: %s", exc)
+        try:
+            self.proc_mgr.stop()
+        except Exception as exc:  # never block close on stop failure
+            logger.warning("Error stopping server on close: %s", exc)
+        self.root.destroy()
 
     def _match_profile_by_model(self, model_path: str) -> Optional[str]:
         """Best-effort: find the profile whose GGUF matches *model_path*.
@@ -3357,22 +3387,8 @@ def create_app(root=None):
     """
     if root is None:
         root = tk.Tk()
-        mw = MainWindow(root)
-
-        # Clean exit on window close: gracefully stop the managed llama-server
-        # so it does not linger as an orphan still holding VRAM/RAM after the GUI
-        # exits. This is what prevented re-opening the loader from spawning a
-        # second server on top of the first (double VRAM).
-        def on_closing():
-            logger.info("App closing — stopping managed server if running")
-            try:
-                mw.proc_mgr.stop()
-            except Exception as exc:  # never block window close on stop failure
-                logger.warning("Error stopping server on close: %s", exc)
-            root.destroy()
-
-        root.protocol("WM_DELETE_WINDOW", on_closing)
-        return mw
+    # Window-close cleanup (save state + stop server) is registered inside
+    # MainWindow.__init__ via WM_DELETE_WINDOW, covering both entry points.
     return MainWindow(root)
 
 

@@ -67,11 +67,8 @@ def main() -> None:
     # Minimum window size: prevents buttons from being squashed below readable width
     root.minsize(960, 720)
 
-    # Save window state on close
-    def on_closing():
-        mw.save_window_state() if hasattr(mw, "save_window_state") else None
-        root.destroy()
-    root.protocol("WM_DELETE_WINDOW", on_closing)
+    # Window-close cleanup (save state + stop server) is handled by
+    # MainWindow._on_closing, registered in MainWindow.__init__.
 
     try:
         mw = MainWindow(root)

@@ -133,3 +133,53 @@ class TestControlBar:
         assert str(mw._toolbar_start_btn.cget("state")) == "disabled"  # type: ignore[attr-defined]
         assert str(mw._toolbar_stop_btn.cget("state")) == "normal"  # type: ignore[attr-defined]
         assert str(mw._toolbar_restart_btn.cget("state")) == "normal"  # type: ignore[attr-defined]
+
+
+class TestOnClosing:
+    """Regression: closing the window must stop the managed llama-server.
+
+    Previously the production entry point (main.py) registered a
+    WM_DELETE_WINDOW handler that only saved window state and never stopped the
+    server, leaving it running (and holding VRAM/RAM) after the GUI closed.
+    The handler now lives in MainWindow._on_closing and must be registered and
+    must call proc_mgr.stop().
+    """
+
+    def test_close_handler_registered(self, tk_root_fixture, tmp_path):
+        from unittest.mock import MagicMock, patch
+        from llamacpp_loader.config.store import ConfigStore
+        from llamacpp_loader.gui.app import MainWindow
+
+        isolated = ConfigStore(path=tmp_path / "settings.json")
+        with patch("llamacpp_loader.config.store.ConfigStore", return_value=isolated):
+            # Capture protocol() registrations made during construction.
+            with patch.object(tk_root_fixture, "protocol", MagicMock()) as mock_proto:
+                MainWindow(tk_root_fixture)
+
+        registered = any(
+            c.args and c.args[0] == "WM_DELETE_WINDOW"
+            for c in mock_proto.call_args_list
+        )
+        assert registered, "WM_DELETE_WINDOW handler not registered on root"
+
+    def test_close_stops_server_and_quits(self, tk_root_fixture, tmp_path):
+        from unittest.mock import MagicMock, patch
+        from llamacpp_loader.config.store import ConfigStore
+        from llamacpp_loader.gui.app import MainWindow
+
+        isolated = ConfigStore(path=tmp_path / "settings.json")
+        with patch("llamacpp_loader.config.store.ConfigStore", return_value=isolated):
+            mw = MainWindow(tk_root_fixture)
+
+        # Stub destroy on the shared root so this test does not tear down the
+        # session-scoped fixture used by other tests.
+        real_destroy = tk_root_fixture.destroy
+        tk_root_fixture.destroy = MagicMock()
+        try:
+            mw.proc_mgr.stop = MagicMock()  # observe the stop call
+            mw._on_closing()  # invoke the close handler directly
+
+            mw.proc_mgr.stop.assert_called_once()
+            tk_root_fixture.destroy.assert_called_once()
+        finally:
+            tk_root_fixture.destroy = real_destroy
