@@ -219,6 +219,11 @@ def find_mtp_draft(model_dir: str | Path, base_stem: str) -> Optional[str]:
             s = p.stem.lower().replace(" ", "-")
             if not is_mtp_draft_filename(s):
                 continue
+            if s == base:
+                # A model whose *own* filename carries an "mtp" token (e.g.
+                # 'Qwen3.6-27B-...-NEO-MTP-IQ3_M.gguf') must never be paired
+                # with itself as its draft. Skip self-matches outright.
+                continue
             cand_base = base_stem_from_mtp(s)        # e.g. 'qwen3.6-35b-a3b-q4_0'
             cand_core = _strip_quant(cand_base)      # 'qwen3.6-35b-a3b'
             if (cand_core == base_core
