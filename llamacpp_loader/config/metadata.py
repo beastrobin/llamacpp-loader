@@ -72,6 +72,7 @@ def read_gguf_meta(path: str | Path) -> dict:
         "expert_count": 0,
         "is_moe": False,
         "mtp_supported": False,
+        "mtp_native": False,
         "ok": False,
     }
     try:
@@ -109,6 +110,31 @@ def read_gguf_meta(path: str | Path) -> dict:
             else:
                 joined = str(layer_types)
             result["mtp_supported"] = "mtp" in joined.lower()
+
+        # Native MTP: some GGs bundle the MTP draft head *inside* the model
+        # itself as an extra <arch>.<block_count>.* tensor block (e.g. the
+        # empero-ai Qwen3.8-27B-Ridge GGUF ships blk.64.* / nextn tensors).
+        # Such models run with ``--spec-type draft-mtp`` and NO external draft
+        # file, so we must detect the in-model head to enable it.
+        try:
+            # A native MTP head appears as an extra block indexed by the
+            # block_count (blk.<n>.*) or as a "nextn" sub-block
+            # (blk.<n>.nextn.* / nextn.*).  Cover both the "block_count
+            # excludes the head" and "block_count includes it" conventions
+            # (e.g. empero-ai Ridge: block_count=65, head lives at blk.64 with
+            # blk.64.nextn.* tensors).
+            blk_prefix = f"blk.{n_layers}."
+            blk_head_nextn = f"blk.{n_layers - 1}.nextn."
+            for t in reader.tensors:
+                name = t.name
+                if (name.startswith(blk_prefix)
+                        or name.startswith(blk_head_nextn)
+                        or "nextn" in name.lower()):
+                    result["mtp_native"] = True
+                    break
+        except Exception:  # noqa: BLE001
+            # Non-fatal: partial read still returns the other capabilities.
+            pass
     except Exception:  # noqa: BLE001
         # Partial read is still useful (e.g. arch + is_moe may be set).
         pass

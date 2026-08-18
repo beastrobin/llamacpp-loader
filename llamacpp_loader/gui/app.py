@@ -810,8 +810,9 @@ class MainWindow:
         if not profile:
             return
         menu = tk.Menu(self._tree, tearoff=0)
+        draft_label = profile.mtp_model or ("(native, in-model)" if profile.mtp_native else "(none)")
         menu.add_command(
-            label=f"Draft: {profile.mtp_model or '(none)'}",
+            label=f"Draft: {draft_label}",
             state=tk.DISABLED)
         menu.add_separator()
         label = "Disable MTP" if profile.mtp_enabled else "Enable MTP"
@@ -1414,10 +1415,16 @@ class MainWindow:
             vision_files = [f for f in profile.extra_files
                           if "mmproj" in f.lower() or "clip" in f.lower()]
             vision_str = "👁" if vision_files else ""
-            # MTP cell: enabled with a draft -> "on", enabled without one -> "on?",
-            # disabled -> "off" (turns green via the changed-overlay when "on").
+            # MTP cell: external draft -> "on", native in-model head -> "on*",
+            # enabled without either -> "on?", disabled -> "off" (turns green
+            # via the changed-overlay when "on").
             if profile.mtp_enabled:
-                mtp_str = "on" if profile.mtp_model else "on?"
+                if profile.mtp_model:
+                    mtp_str = "on"
+                elif profile.mtp_native:
+                    mtp_str = "on*"
+                else:
+                    mtp_str = "on?"
             else:
                 mtp_str = "off"
             presets_str = profile.active_preset or recommend.PRESET_DEFAULT

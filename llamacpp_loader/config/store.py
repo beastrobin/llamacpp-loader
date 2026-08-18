@@ -197,6 +197,7 @@ class ModelProfile:
     # Autonomous capability detection (read from the GGUF at scan/add time).
     is_moe: bool = False             # Mixture-of-Experts (expert_count > 0)
     mtp_supported: bool = False      # base model trained with MTP layers
+    mtp_native: bool = False         # native MTP draft head bundled inside the GGUF
 
     # MTP (Multi-Token Prediction) speculative decoding.
     mtp_enabled: bool = False        # use an MTP draft model at launch
@@ -316,6 +317,7 @@ class ModelProfile:
             "reasoning_forced": self.reasoning_forced,
             "is_moe": self.is_moe,
             "mtp_supported": self.mtp_supported,
+            "mtp_native": self.mtp_native,
             "mtp_enabled": self.mtp_enabled,
             "mtp_model": self.mtp_model,
             "server": self.server.to_dict(),
@@ -345,6 +347,7 @@ class ModelProfile:
             reasoning_forced=bool(data.get("reasoning_forced", False)),
             is_moe=bool(data.get("is_moe", False)),
             mtp_supported=bool(data.get("mtp_supported", False)),
+            mtp_native=bool(data.get("mtp_native", False)),
             mtp_enabled=bool(data.get("mtp_enabled", False)),
             mtp_model=str(data.get("mtp_model", "") or ""),
             server=ServerParams.from_dict(server_data),
@@ -406,6 +409,8 @@ def _enrich_profile_from_gguf(profile: "ModelProfile", gguf_path: Path,
             object.__setattr__(profile, "is_moe", True)
         if meta.get("mtp_supported"):
             object.__setattr__(profile, "mtp_supported", True)
+        if meta.get("mtp_native"):
+            object.__setattr__(profile, "mtp_native", True)
 
     # Auto-detect a sibling MTP draft model.
     base_stem = Path(gguf_path).stem.replace(" ", "-").lower()

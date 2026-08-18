@@ -70,6 +70,7 @@ class ServerConfig:
     mmproj: str = ""               # vision projector GGUF path (--mmproj)
     mtp_enabled: bool = False      # use an MTP draft model (speculative decoding)
     mtp_model: str = ""            # draft GGUF path (--spec-draft-model)
+    mtp_native: bool = False       # native MTP head inside the model GGUF (no external draft)
     mtp_n_max: int = 3             # max draft tokens (--spec-draft-n-max)
     flash_attn: str = "auto"      # Flash Attention: "auto" | "on" | "off"
 
@@ -215,6 +216,7 @@ class ProcessManager:
                 mmproj=mmproj,
                 mtp_enabled=config.mtp_enabled,
                 mtp_model=mtp_model,
+                mtp_native=getattr(config, "mtp_native", False),
                 mtp_n_max=getattr(config, "mtp_n_max", 3),
                 flash_attn=getattr(config.server, "flash_attn", "auto"),
             )
@@ -474,13 +476,17 @@ class ProcessManager:
                     "Declared mmproj projector not found, refusing to start a "
                     f"vision-less server: {config.mmproj}")
 
-        # MTP speculative decoding (Multi-Token Prediction). Requires a separate
-        # draft model GGUF; skipped if the file is missing so launch still works.
-        # Speculative decoding (MTP / DFlash / EAGLE3 draft model).
-        # IMPORTANT: --spec-type defaults to 'none', so the draft type MUST be
-        # set explicitly or llama-server silently ignores the draft model.
-        if config.mtp_enabled and config.mtp_model:
-            if os.path.isfile(config.mtp_model):
+        # MTP speculative decoding (Multi-Token Prediction).
+        #  - External draft: a separate draft GGUF is passed via
+        #    --spec-draft-model (MTP / DFlash / EAGLE3, type inferred from the
+        #    filename).
+        #  - Native draft: the draft head is bundled inside the model GGUF
+        #    itself (e.g. empero-ai Ridge quants expose blk.<n>.* / nextn
+        #    tensors); then only --spec-type draft-mtp is needed, no external
+        #    file.  Without --spec-type the server silently ignores the draft,
+        #    so it MUST be set explicitly in both cases.
+        if config.mtp_enabled:
+            if config.mtp_model and os.path.isfile(config.mtp_model):
                 stem = config.mtp_model.lower().replace(" ", "-")
                 if "dflash" in stem:
                     draft_type = "draft-dflash"
@@ -491,7 +497,10 @@ class ProcessManager:
                 cmd.extend(["--spec-type", draft_type])
                 cmd.extend(["--spec-draft-model", config.mtp_model])
                 cmd.extend(["--spec-draft-n-max", str(config.mtp_n_max)])
-            else:
+            elif config.mtp_native:
+                cmd.extend(["--spec-type", "draft-mtp"])
+                cmd.extend(["--spec-draft-n-max", str(config.mtp_n_max)])
+            elif config.mtp_model:
                 self._forward_log(
                     f"draft model not found, skipping speculative decoding: {config.mtp_model}")
 
