@@ -384,6 +384,32 @@ class ProcessManager:
             f"port {data.get('port')})")
         return pid
 
+    def recover_any(self) -> Optional[int]:
+        """Adopt a live llama-server: registry first, then scan the system.
+
+        The registry path covers servers spawned by an earlier loader session
+        that died before cleanup (crash / force-kill / power loss). The system
+        scan catches orphaned llama-server processes with no (or stale)
+        registry entry — e.g. servers started manually, or a registry that was
+        cleared while the server kept running. Either way the caller receives a
+        PID it can manage (and Stop) from the UI.
+        """
+        pid = self.recover()
+        if pid is not None:
+            return pid
+        for cand in scan_llama_server_pids():
+            with self._lock:
+                self._process = _PidHandle(cand)
+            self._set_state(ProcessState.RUNNING)
+            self._forward_log(
+                f"Adopted orphan llama-server from system scan (PID {cand})")
+            return cand
+        return None
+
+    def registry_info(self) -> Optional[dict]:
+        """Return the on-disk server registry (pid/host/port/exe/model)."""
+        return read_registry()
+
     def restart(self, config: ServerConfig | ModelProfile = None) -> bool:
         """Stop then start in one atomic operation.
 
@@ -785,6 +811,53 @@ def _pid_is_llama_server(pid: int) -> bool:
         return True
     base = os.path.basename(name).lower()
     return "llama-server" in base or "llama_server" in base
+
+
+def scan_llama_server_pids() -> list[int]:
+    """Enumerate live llama-server processes on this machine (best-effort).
+
+    Uses the Windows toolhelp snapshot API (zero external dependencies, same
+    style as the other ctypes helpers). Returns ``[]`` on non-Windows or any
+    failure so callers degrade gracefully to registry-only adoption.
+    """
+    if os.name != "nt":
+        return []
+    pids: list[int] = []
+    try:
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        TH32CS_SNAPPROCESS = 0x00000002
+        snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snap in (0, ctypes.c_void_p(-1).value):
+            return []
+
+        class _PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", ctypes.c_ulong),
+                ("cntUsage", ctypes.c_ulong),
+                ("th32ProcessID", ctypes.c_ulong),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", ctypes.c_ulong),
+                ("cntThreads", ctypes.c_ulong),
+                ("th32ParentProcessID", ctypes.c_ulong),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", ctypes.c_ulong),
+                ("szExeFile", ctypes.c_wchar * 260),
+            ]
+
+        try:
+            entry = _PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+            ok = kernel32.Process32FirstW(snap, ctypes.byref(entry))
+            while ok:
+                name = entry.szExeFile.lower()
+                if "llama-server" in name or "llama_server" in name:
+                    pids.append(int(entry.th32ProcessID))
+                ok = kernel32.Process32NextW(snap, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snap)
+    except Exception:  # noqa: BLE001 — best-effort scan
+        pass
+    return pids
 
 
 class _PidHandle:

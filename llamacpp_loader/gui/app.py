@@ -153,22 +153,69 @@ class MainWindow:
         self.root.after(0, lambda: self._console_panel.append_line(line))
 
     def _recover_existing_server(self) -> None:
-        """Take ownership of a server a previous loader session left running.
+        """Take ownership of a llama-server left running by a previous session.
 
-        If ProcessManager.recover() finds a live server in its on-disk
-        registry, reflect that in the UI (enable Stop, mark running) and tell
-        the user. Without this, the orphaned server could not be stopped from
-        the new session.
+        ProcessManager.recover_any() first consults the on-disk registry
+        (crashed loader sessions), then scans the system for orphaned
+        llama-server processes. When a live server is found this session adopts
+        it so the Stop button works; the matching model row is highlighted and
+        the PID / model name are shown in the status bar.
         """
-        pid = self.proc_mgr.recover()
+        pid = self.proc_mgr.recover_any()
         if pid is None:
             return
+        info = self.proc_mgr.registry_info() or {}
+        model_path = info.get("model") or ""
+        port = info.get("port")
+
+        matched = self._match_profile_by_model(model_path) if model_path else None
+        if matched:
+            # Selecting the profile refreshes port + PID indicators and applies
+            # the row highlight; the running highlight is driven by
+            # _running_profile_name being set first.
+            self._selected_profile_name = matched
+            self._running_profile_name = matched
+            self._load_profile_to_ui(matched)
+        else:
+            self._status_bar.set_pid(pid)
+            if port:
+                self._status_bar.set_port(int(port))
+
         self._set_toolbar_running(True)
+        if matched:
+            pr = self.store.load(matched)
+            label = pr.display_name if pr else matched
+        else:
+            label = model_path or f"PID {pid}"
         self._status_bar.set_state(
-            "running",
-            f"已接管上次会话遗留的 server (PID {pid})，可点 Stop 停止")
+            "running", f"已接管正在运行的 server (PID {pid}) — {label}")
         self._console_panel.append_line(
-            f"[LOADER] 已接管上次会话遗留的 server (PID {pid})，点 Stop 即可关闭它。")
+            f"[LOADER] 已接管正在运行的 llama-server (PID {pid})，模型: {label}。"
+            "点 Stop 即可关闭它。")
+
+    def _match_profile_by_model(self, model_path: str) -> Optional[str]:
+        """Best-effort: find the profile whose GGUF matches *model_path*.
+
+        ``model_path`` is the absolute GGUF path recorded in the server
+        registry (the ``--model`` value from the last spawn). Matches against
+        each profile's ``gguf_file`` and ``model_path/gguf_file`` combination,
+        falling back to a basename comparison.
+        """
+        if not model_path:
+            return None
+        norm = os.path.normcase(os.path.abspath(model_path))
+        for name in self.store.list_profiles():
+            pr = self.store.load(name)
+            if not pr or not pr.gguf_file:
+                continue
+            cands = [os.path.normcase(os.path.abspath(pr.gguf_file))]
+            if pr.model_path:
+                cands.append(os.path.normcase(
+                    os.path.abspath(os.path.join(pr.model_path, pr.gguf_file))))
+            for c in cands:
+                if c == norm or os.path.basename(c) == os.path.basename(norm):
+                    return name
+        return None
 
     def _build_ui(self) -> None:
         """Build all widgets and lay them out."""
