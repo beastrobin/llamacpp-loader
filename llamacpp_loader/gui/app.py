@@ -2163,6 +2163,8 @@ class MainWindow:
         # Update port indicator to match selected profile
         self._active_port = profile.server.port
         self._status_bar.set_port(profile.server.port)
+        # Show the PID of any server already running for this/other profile.
+        self._status_bar.set_pid(self.proc_mgr.get_pid())
         # NOTE: do NOT rebuild the table here — rebuilding clears the native
         # Treeview selection and makes the active row look un-highlighted.
         # Just re-stamp the selection highlight.
@@ -2651,6 +2653,8 @@ class MainWindow:
         self._active_port = profile.server.port
         self._status_bar.set_state("running", f"Running on port {profile.server.port}")
         self._status_bar.set_port(profile.server.port)
+        # Show the freshly spawned server PID next to the port.
+        self._status_bar.set_pid(self.proc_mgr.get_pid())
         # Clear the server-output panel and show a launch banner; real logs
         # stream in live from the subprocess reader thread.
         self._console_panel.clear()
@@ -2758,6 +2762,7 @@ class MainWindow:
         """Stop the running server."""
         self.proc_mgr.stop()
         self._status_bar.set_state("idle", "Server stopped")
+        self._status_bar.set_pid(None)
         self._set_toolbar_running(False)
         # Drop the running highlight.
         self._running_profile_name = ""
@@ -3203,6 +3208,9 @@ class StatusBar(ttk.Frame):
         # Port indicator on the LEFT (user wants it visible first)
         self._port_label = ttk.Label(self, text="Port: 8080", style="Dim.TLabel")
         self._port_label.pack(side=tk.LEFT, padx=(0, 8))
+        # PID indicator next to the port — shows the running llama-server PID.
+        self._pid_label = ttk.Label(self, text="PID: --", style="Dim.TLabel")
+        self._pid_label.pack(side=tk.LEFT, padx=(0, 8))
         # Status text with flat relief — no white border box.
         self._label = ttk.Label(
             self, text="Status: idle", relief=tk.FLAT, anchor=tk.W)
@@ -3257,6 +3265,14 @@ class StatusBar(ttk.Frame):
     def set_port(self, port: int) -> None:
         """Update the port indicator (right side of the status bar)."""
         self._port_label.config(text=f"Port: {port}")
+
+    def set_pid(self, pid) -> None:
+        """Update the PID indicator (next to the port).
+
+        ``pid`` may be ``None`` (or falsy) to show a placeholder while no
+        server process is running.
+        """
+        self._pid_label.config(text=f"PID: {pid}" if pid else "PID: --")
 
     def set_resources(self, ram_used: float, ram_total: float,
                       vram_used: float, vram_total: float) -> None:
