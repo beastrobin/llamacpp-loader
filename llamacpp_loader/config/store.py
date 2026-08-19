@@ -202,6 +202,10 @@ class ModelProfile:
     # MTP (Multi-Token Prediction) speculative decoding.
     mtp_enabled: bool = False        # use an MTP draft model at launch
     mtp_model: str = ""             # draft GGUF filename (relative to model_path)
+    mtp_n_max: int = 7              # max draft tokens/step for native MTP or mtp/eagle drafts
+    dflash_model: str = ""         # DFlash external draft path (Inco AI DFlash 2)
+    dflash_n_max: int = 7          # draft steps for DFlash (--spec-draft-n-max)
+    dflash_enabled: bool = False   # enable DFlash speculative decoding
 
     server: ServerParams = field(default_factory=ServerParams)
     inference: InferenceParams = field(default_factory=InferenceParams)
@@ -320,6 +324,10 @@ class ModelProfile:
             "mtp_native": self.mtp_native,
             "mtp_enabled": self.mtp_enabled,
             "mtp_model": self.mtp_model,
+            "mtp_n_max": self.mtp_n_max,
+            "dflash_model": self.dflash_model,
+            "dflash_n_max": self.dflash_n_max,
+            "dflash_enabled": self.dflash_enabled,
             "server": self.server.to_dict(),
             "inference": self.inference.to_dict(),
             "sampling": self.sampling.to_dict(),
@@ -334,6 +342,21 @@ class ModelProfile:
         server_data = data.get("server", {})
         inference_data = data.get("inference", {})
         sampling_data = data.get("sampling", {})
+
+        # MTP / DFlash drafts.  Legacy configs stored a DFlash draft under
+        # mtp_model; relocate it to dflash_model so the two stay separate.
+        mtp_model = str(data.get("mtp_model", "") or "")
+        dflash_model = str(data.get("dflash_model", "") or "")
+        dflash_enabled = bool(data.get("dflash_enabled", False))
+        # Migration: a DFlash draft previously enabled under mtp_enabled should
+        # move to dflash_enabled so the two switches are independent.
+        if dflash_model and not dflash_enabled:
+            dflash_enabled = True
+        if "dflash" in mtp_model.lower() and not dflash_model:
+            dflash_model = mtp_model
+            mtp_model = ""
+            dflash_enabled = True
+
         return cls(
             profile_name=data.get("profile_name", ""),
             display_name=data.get("display_name", ""),
@@ -349,7 +372,11 @@ class ModelProfile:
             mtp_supported=bool(data.get("mtp_supported", False)),
             mtp_native=bool(data.get("mtp_native", False)),
             mtp_enabled=bool(data.get("mtp_enabled", False)),
-            mtp_model=str(data.get("mtp_model", "") or ""),
+            mtp_model=mtp_model,
+            mtp_n_max=int(data.get("mtp_n_max", 7) or 7),
+            dflash_model=dflash_model,
+            dflash_n_max=int(data.get("dflash_n_max", 7) or 7),
+            dflash_enabled=dflash_enabled,
             server=ServerParams.from_dict(server_data),
             inference=InferenceParams.from_dict(inference_data),
             sampling=SamplingParams.from_dict(sampling_data),
@@ -423,8 +450,12 @@ def _enrich_profile_from_gguf(profile: "ModelProfile", gguf_path: Path,
         except Exception:  # noqa: BLE001
             draft_name = None
     if draft_name:
-        object.__setattr__(profile, "mtp_model", draft_name)
-        object.__setattr__(profile, "mtp_enabled", True)
+        if "dflash" in draft_name.lower():
+            object.__setattr__(profile, "dflash_model", draft_name)
+            object.__setattr__(profile, "dflash_enabled", True)
+        else:
+            object.__setattr__(profile, "mtp_model", draft_name)
+            object.__setattr__(profile, "mtp_enabled", True)
 
 
 class ConfigStore:
@@ -526,6 +557,15 @@ class ConfigStore:
             self._agents = agents_raw
         else:
             self._agents = []
+
+        # Persist any legacy draft migration performed by ModelProfile.from_dict
+        # (DFlash drafts previously stored under mtp_model are relocated to
+        # dflash_model).  Rewrite the on-disk file so the migration sticks.
+        for pdata in profiles_raw.values():
+            if isinstance(pdata, dict) and "dflash" in str(pdata.get("mtp_model", "")).lower() \
+                    and not str(pdata.get("dflash_model", "")).strip():
+                self.save()
+                break
 
     def save(self) -> None:
         """Persist current state to disk (thread-safe).

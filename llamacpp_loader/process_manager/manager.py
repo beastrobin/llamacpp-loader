@@ -71,7 +71,10 @@ class ServerConfig:
     mtp_enabled: bool = False      # use an MTP draft model (speculative decoding)
     mtp_model: str = ""            # draft GGUF path (--spec-draft-model)
     mtp_native: bool = False       # native MTP head inside the model GGUF (no external draft)
-    mtp_n_max: int = 3             # max draft tokens (--spec-draft-n-max)
+    mtp_n_max: int = 7             # max draft tokens for native MTP or mtp/eagle drafts
+    dflash_model: str = ""        # DFlash external draft path (--spec-draft-model)
+    dflash_n_max: int = 7         # draft steps for DFlash (--spec-draft-n-max)
+    dflash_enabled: bool = False  # enable DFlash speculative decoding
     flash_attn: str = "auto"      # Flash Attention: "auto" | "on" | "off"
 
 
@@ -195,11 +198,16 @@ class ProcessManager:
                 if "mmproj" in f.lower() or "clip" in f.lower():
                     mmproj = os.path.join(config.model_path, f) if config.model_path else f
                     break
-            # MTP draft model (separate field so it is not confused with mmproj)
+            # MTP / DFlash draft models (separate fields so they are not
+            # confused with mmproj or each other).
             mtp_model = ""
             if config.mtp_enabled and config.mtp_model:
                 mtp_model = (os.path.join(config.model_path, config.mtp_model)
                              if config.model_path else config.mtp_model)
+            dflash_model = ""
+            if getattr(config, "dflash_enabled", False) and getattr(config, "dflash_model", ""):
+                dflash_model = (os.path.join(config.model_path, getattr(config, "dflash_model", ""))
+                                if config.model_path else getattr(config, "dflash_model", ""))
             sc = ServerConfig(
                 model_path=model_cmd,
                 host=server.host,
@@ -217,7 +225,10 @@ class ProcessManager:
                 mtp_enabled=config.mtp_enabled,
                 mtp_model=mtp_model,
                 mtp_native=getattr(config, "mtp_native", False),
-                mtp_n_max=getattr(config, "mtp_n_max", 3),
+                mtp_n_max=getattr(config, "mtp_n_max", 7),
+                dflash_model=dflash_model,
+                dflash_n_max=getattr(config, "dflash_n_max", 7),
+                dflash_enabled=getattr(config, "dflash_enabled", False),
                 flash_attn=getattr(config.server, "flash_attn", "auto"),
             )
         elif isinstance(config, ServerConfig):
@@ -511,24 +522,37 @@ class ProcessManager:
         #    tensors); then only --spec-type draft-mtp is needed, no external
         #    file.  Without --spec-type the server silently ignores the draft,
         #    so it MUST be set explicitly in both cases.
-        if config.mtp_enabled:
-            if config.mtp_model and os.path.isfile(config.mtp_model):
-                stem = config.mtp_model.lower().replace(" ", "-")
-                if "dflash" in stem:
-                    draft_type = "draft-dflash"
-                elif "eagle" in stem:
-                    draft_type = "draft-eagle3"
-                else:
-                    draft_type = "draft-mtp"
-                cmd.extend(["--spec-type", draft_type])
-                cmd.extend(["--spec-draft-model", config.mtp_model])
-                cmd.extend(["--spec-draft-n-max", str(config.mtp_n_max)])
-            elif config.mtp_native:
-                cmd.extend(["--spec-type", "draft-mtp"])
-                cmd.extend(["--spec-draft-n-max", str(config.mtp_n_max)])
-            elif config.mtp_model:
-                self._forward_log(
-                    f"draft model not found, skipping speculative decoding: {config.mtp_model}")
+        # DFlash and MTP are independent toggles (each with its own model /
+        # n_max), but only ONE --spec-type can be active at launch, so resolve
+        # by priority:
+        #   1. DFlash external draft (Inco AI DFlash 2)  -> draft-dflash
+        #   2. MTP/EAGLE external draft                -> draft-mtp / draft-eagle3
+        #   3. native in-model MTP head                -> draft-mtp (no file)
+        dflash_ok = (config.dflash_enabled and config.dflash_model
+                     and os.path.isfile(config.dflash_model))
+        mtp_ext_ok = (config.mtp_enabled and config.mtp_model
+                      and os.path.isfile(config.mtp_model))
+        if dflash_ok:
+            cmd.extend(["--spec-type", "draft-dflash"])
+            cmd.extend(["--spec-draft-model", config.dflash_model])
+            cmd.extend(["--spec-draft-n-max", str(config.dflash_n_max)])
+        elif mtp_ext_ok:
+            stem = config.mtp_model.lower().replace(" ", "-")
+            if "eagle" in stem:
+                draft_type = "draft-eagle3"
+            else:
+                draft_type = "draft-mtp"
+            cmd.extend(["--spec-type", draft_type])
+            cmd.extend(["--spec-draft-model", config.mtp_model])
+            cmd.extend(["--spec-draft-n-max", str(config.mtp_n_max)])
+        elif config.mtp_enabled and config.mtp_native:
+            cmd.extend(["--spec-type", "draft-mtp"])
+            cmd.extend(["--spec-draft-n-max", str(config.mtp_n_max)])
+        elif (config.dflash_enabled and config.dflash_model) or (
+                config.mtp_enabled and config.mtp_model):
+            missing = config.dflash_model or config.mtp_model
+            self._forward_log(
+                f"draft model not found, skipping speculative decoding: {missing}")
 
         # Reasoning toggle (llama-server >= b4xxx supports --reasoning on/off).
         # Only emit when enabling reasoning — "off" is the server default, so

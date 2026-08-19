@@ -42,7 +42,7 @@ import threading
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Optional
 
 from llamacpp_loader import __version__ as APP_VERSION
@@ -350,8 +350,8 @@ class MainWindow:
     # Column layout (order = Treeview column order).
     # Order note: "speed" sits directly LEFT of "kv"; "size" is left of "quant".
     TABLE_COLUMNS = ("model", "size", "quant", "speed", "inf_group", "kv", "ctx",
-                     "reasoning", "gpu", "threads", "mtp", "vision", "sam_group",
-                     "temp", "topk", "topp", "rp", "presets")
+                     "reasoning", "gpu", "threads", "mtp", "dflash", "vision",
+                     "sam_group", "temp", "topk", "topp", "rp", "presets")
     TABLE_HEADINGS = {
         "model": "Model",
         "size": "Size",
@@ -368,20 +368,21 @@ class MainWindow:
         "rp": "Repeat",
         "vision": "Vision",
         "mtp": "MTP",
+        "dflash": "DFlash",
         "presets": "Presets",
         # Group toggle columns — blank data columns that fold their group.
         "inf_group": "Inference",
         "sam_group": "Sampling",
     }
     # Inference group = server-adjacent execution knobs; Sampling group = generation knobs
-    INFERENCE_COLS = {"kv", "ctx", "reasoning", "gpu", "threads", "mtp", "vision"}
+    INFERENCE_COLS = {"kv", "ctx", "reasoning", "gpu", "threads", "mtp", "dflash", "vision"}
     SAMPLING_COLS = {"temp", "topk", "topp", "rp"}
     # Column widths: Model gets a generous width; sampling cols are narrow numbers
     TABLE_WIDTHS = {
         "model": 300, "size": 90, "quant": 78, "speed": 66, "inf_group": 70,
         "kv": 70, "ctx": 64, "reasoning": 68, "gpu": 58, "threads": 58,
         "sam_group": 70, "temp": 52, "topk": 52, "topp": 52, "rp": 56,
-        "vision": 52, "mtp": 56, "presets": 96,
+        "vision": 52, "mtp": 56, "dflash": 56, "presets": 96,
     }
     # Per-column header background/foreground for the custom (non-ttk) header row.
     # Inference columns get a blue tint, Sampling columns an amber tint, the rest
@@ -407,6 +408,7 @@ class MainWindow:
         "quant": (theme.CARD, theme.TEXT_DIM),
         "speed": (theme.CARD, theme.TEXT_DIM),
         "mtp": ("#2f3e52", "#cfe3ff"),
+        "dflash": ("#2f3e52", "#cfe3ff"),
         "vision": ("#2f3e52", "#cfe3ff"),
         "presets": (theme.CARD, theme.TEXT_DIM),
     }
@@ -427,6 +429,7 @@ class MainWindow:
         "rp": "Repeat",
         "vision": "Vision",
         "mtp": "MTP",
+        "dflash": "DFlash",
         "presets": "Presets",
         # Group toggle columns — blank, used only for folding.
         "inf_group": "Inference",
@@ -753,6 +756,8 @@ class MainWindow:
             self._attach_vision_model(row_id)
         elif col == "mtp":
             self._open_mtp_menu(row_id)
+        elif col == "dflash":
+            self._open_dflash_menu(row_id)
         elif col == "presets":
             self._open_presets_menu(row_id, event.x_root, event.y_root)
 
@@ -882,7 +887,7 @@ class MainWindow:
 
     # ----------------------------------------------------------- MTP (spec decoding)
     def _open_mtp_menu(self, name: str) -> None:
-        """Popup menu: enable/disable MTP and attach / auto-detect / detach draft."""
+        """Popup menu for the native / external mtp-eagle spec decoding track."""
         profile = self.store.load(name)
         if not profile:
             return
@@ -901,6 +906,34 @@ class MainWindow:
         if profile.mtp_model:
             menu.add_command(label="Detach Draft",
                              command=lambda: self._detach_mtp_model(name))
+        menu.add_separator()
+        menu.add_command(label=f"Set draft n-max: {profile.mtp_n_max}",
+                         command=lambda: self._set_mtp_n_max(name))
+        x = self._tree.winfo_pointerx()
+        y = self._tree.winfo_pointery()
+        menu.tk_popup(x, y)
+
+    def _open_dflash_menu(self, name: str) -> None:
+        """Popup menu for the DFlash (Inco AI DFlash 2) external draft track."""
+        profile = self.store.load(name)
+        if not profile:
+            return
+        menu = tk.Menu(self._tree, tearoff=0)
+        draft_label = profile.dflash_model or "(none)"
+        menu.add_command(
+            label=f"Draft: {draft_label}",
+            state=tk.DISABLED)
+        menu.add_separator()
+        label = "Disable DFlash" if profile.dflash_enabled else "Enable DFlash"
+        menu.add_command(label=label, command=lambda: self._toggle_dflash(name))
+        menu.add_command(label="Attach / Replace DFlash Draft...",
+                         command=lambda: self._pick_dflash_file(name))
+        if profile.dflash_model:
+            menu.add_command(label="Detach DFlash Draft",
+                             command=lambda: self._detach_dflash_model(name))
+        menu.add_separator()
+        menu.add_command(label=f"Set DFlash n-max: {profile.dflash_n_max}",
+                         command=lambda: self._set_dflash_n_max(name))
         x = self._tree.winfo_pointerx()
         y = self._tree.winfo_pointery()
         menu.tk_popup(x, y)
@@ -957,6 +990,71 @@ class MainWindow:
         if not profile:
             return
         self.store.update(name, {"mtp_model": "", "mtp_enabled": False})
+        self._refresh_model_table(self.store.list_profiles())
+
+    def _set_mtp_n_max(self, name: str) -> None:
+        """Set the speculative-decoding max draft tokens (--spec-draft-n-max)."""
+        profile = self.store.load(name)
+        if not profile:
+            return
+        val = simpledialog.askinteger(
+            "Draft n-max",
+            "Max draft tokens per step (--spec-draft-n-max).\n"
+            "DFlash2 recommends 7; MTP/EAGLE usually 3-4:",
+            initialvalue=getattr(profile, "mtp_n_max", 7),
+            minvalue=1, maxvalue=16,
+        )
+        if val is None:
+            return
+        self.store.update(name, {"mtp_n_max": int(val)})
+        self._refresh_model_table(self.store.list_profiles())
+
+    def _toggle_dflash(self, name: str) -> None:
+        """Enable / disable DFlash speculative decoding for this profile."""
+        profile = self.store.load(name)
+        if not profile:
+            return
+        self.store.update(name, {"dflash_enabled": not profile.dflash_enabled})
+        self._refresh_model_table(self.store.list_profiles())
+
+    def _pick_dflash_file(self, name: str) -> None:
+        """Open file picker and attach a DFlash draft GGUF (absolute path)."""
+        from tkinter import filedialog as fd
+        path = fd.askopenfilename(
+            title=f"Attach DFlash Draft Model for {name}",
+            filetypes=[("GGUF model", "*.gguf"), ("All files", "*.*")],
+            initialdir=self.store.get_ui_state().last_browse_dir,
+        )
+        if not path:
+            return
+        p = Path(path)
+        self.store.set_ui_state(last_browse_dir=str(p.parent))
+        self.store.update(name, {"dflash_model": str(p), "dflash_enabled": True})
+        self._refresh_model_table(self.store.list_profiles())
+
+    def _detach_dflash_model(self, name: str) -> None:
+        """Remove the DFlash draft association and disable DFlash."""
+        profile = self.store.load(name)
+        if not profile:
+            return
+        self.store.update(name, {"dflash_model": "", "dflash_enabled": False})
+        self._refresh_model_table(self.store.list_profiles())
+
+    def _set_dflash_n_max(self, name: str) -> None:
+        """Set the DFlash max draft tokens (--spec-draft-n-max)."""
+        profile = self.store.load(name)
+        if not profile:
+            return
+        val = simpledialog.askinteger(
+            "DFlash n-max",
+            "Max draft tokens per step (--spec-draft-n-max).\n"
+            "DFlash2 recommends 7:",
+            initialvalue=getattr(profile, "dflash_n_max", 7),
+            minvalue=1, maxvalue=16,
+        )
+        if val is None:
+            return
+        self.store.update(name, {"dflash_n_max": int(val)})
         self._refresh_model_table(self.store.list_profiles())
 
     def _open_presets_menu(self, name: str, x: int, y: int) -> None:
@@ -1492,9 +1590,8 @@ class MainWindow:
             vision_files = [f for f in profile.extra_files
                           if "mmproj" in f.lower() or "clip" in f.lower()]
             vision_str = "👁" if vision_files else ""
-            # MTP cell: external draft -> "on", native in-model head -> "on*",
-            # enabled without either -> "on?", disabled -> "off" (turns green
-            # via the changed-overlay when "on").
+            # MTP cell: external mtp/eagle draft -> "on", native in-model head
+            # -> "on*", enabled without either -> "on?", disabled -> "off".
             if profile.mtp_enabled:
                 if profile.mtp_model:
                     mtp_str = "on"
@@ -1504,6 +1601,12 @@ class MainWindow:
                     mtp_str = "on?"
             else:
                 mtp_str = "off"
+            # DFlash cell: external DFlash draft enabled -> "on", enabled
+            # without a draft file -> "on?", disabled -> "off".
+            if profile.dflash_enabled:
+                dflash_str = "on" if profile.dflash_model else "on?"
+            else:
+                dflash_str = "off"
             presets_str = profile.active_preset or recommend.PRESET_DEFAULT
             # The community "default" preset is locked — flag it so the user
             # knows edits must go into a custom Preset 1/2/3.
@@ -1529,6 +1632,7 @@ class MainWindow:
                     inf.gpu_layers,
                     inf.n_threads,
                     mtp_str,
+                    dflash_str,
                     vision_str,
                     "",                              # sam_group: blank fold toggle
                     f"{sam.temperature:.2f}",

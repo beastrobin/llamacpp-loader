@@ -169,8 +169,15 @@ def is_mtp_draft_filename(stem: str) -> bool:
     """
     s = stem.lower().replace(" ", "-")
     tokens = s.split("-")
-    if "mtp" in tokens or "dflash" in tokens or any(t.startswith("eagle") for t in tokens):
-        return True
+    # Substring/prefix matching so "dflash2" (Inco AI's DFlash 2 draft) is
+    # recognised in addition to exact "dflash", plus "mtp"/"eagle*" prefixes.
+    for t in tokens:
+        if t == "mtp" or t.startswith("mtp"):
+            return True
+        if "dflash" in t:
+            return True
+        if t.startswith("eagle"):
+            return True
     return False
 
 
@@ -181,8 +188,17 @@ def base_stem_from_mtp(stem: str) -> str:
     """
     s = stem.lower().replace(" ", "-")
     tokens = s.split("-")
-    cleaned = [t for t in tokens
-               if t not in ("mtp", "dflash") and not t.startswith("eagle")]
+    # Mirror is_mtp_draft_filename: drop any token that is/contains the
+    # draft-type marker (mtp / dflash / dflash2 / eagle*), keeping the rest.
+    cleaned = []
+    for t in tokens:
+        if t == "mtp" or t.startswith("mtp"):
+            continue
+        if "dflash" in t:
+            continue
+        if t.startswith("eagle"):
+            continue
+        cleaned.append(t)
     return "-".join(cleaned)
 
 
