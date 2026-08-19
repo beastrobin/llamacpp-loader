@@ -6,14 +6,15 @@ pushd "%~dp0"
 
 :: Locate a Python interpreter on PATH (no hard-coded user paths - keeps the
 :: script portable and avoids leaking the local username into a public repo).
-:: Prefer pythonw (no console window); fall back to python (console) if missing.
-:: Each candidate is verified to actually import llamacpp_loader before use.
+:: Prefer python (launched hidden via PowerShell, so no console window either);
+:: pythonw is only a fallback. python.exe's tkinter is the reliable one here.
+:: Each candidate is verified to import BOTH llamacpp_loader AND tkinter (the GUI needs Tk).
 set "PYW="
-for %%P in (pythonw python) do (
+for %%P in (python pythonw) do (
     if not defined PYW (
         for /f "delims=" %%I in ('where %%P 2^>nul') do (
             if not defined PYW (
-                "%%I" -c "import llamacpp_loader" >nul 2>nul
+                "%%I" -c "import llamacpp_loader, tkinter" >nul 2>nul
                 if not errorlevel 1 set "PYW=%%I"
             )
         )
