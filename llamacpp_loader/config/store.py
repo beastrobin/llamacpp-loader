@@ -347,10 +347,10 @@ class ModelProfile:
         # mtp_model; relocate it to dflash_model so the two stay separate.
         mtp_model = str(data.get("mtp_model", "") or "")
         dflash_model = str(data.get("dflash_model", "") or "")
+        # Auto-enable DFlash only for legacy configs that predate the
+        # dflash_enabled key.  An explicit False from the user must stick.
         dflash_enabled = bool(data.get("dflash_enabled", False))
-        # Migration: a DFlash draft previously enabled under mtp_enabled should
-        # move to dflash_enabled so the two switches are independent.
-        if dflash_model and not dflash_enabled:
+        if dflash_model and "dflash_enabled" not in data:
             dflash_enabled = True
         if "dflash" in mtp_model.lower() and not dflash_model:
             dflash_model = mtp_model
