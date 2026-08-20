@@ -460,21 +460,15 @@ class MainWindow:
     # editable even on the locked default preset — otherwise the green "changed"
     # overlay would silently block editing q8_0 / q4_0 forever.
     SAMPLING_COLS = {"temp", "topk", "topp", "rp"}
-    KV_OPTIONS = ["f16", "f32", "q8_0", "q6_k", "q5_k", "q4_k", "q4_0", "q3_k",
-                  "iq4_nl", "iq4_xs"]
+    KV_OPTIONS = ["f16", "f32", "q8_0", "q5_0", "q5_1", "q4_0", "q4_1", "iq4_nl"]
     # KV-cache compression severity: larger number = more compressed. Used so the
     # KV column sorts by compression level (f16 least, then q8_0, q6_k, q5_k,
     # q4_k/q4_0, q3_k, ...). Unknown types sort last.
     KV_RANK = {
         "f16": 0, "f32": 0,
-        "q8_0": 1, "q8_k": 1,
-        "q6_k": 2, "q6_0": 2,
-        "q5_k": 3, "q5_0": 3, "q5_1": 3,
-        "q4_k": 4, "q4_0": 4, "q4_1": 4,
-        "iq4_nl": 4, "iq4_xs": 4, "iq4_0": 4,
-        "q3_k": 5, "q3_0": 5,
-        "iq3_xxs": 5, "iq3_xs": 5,
-        "q2_k": 6, "q2_0": 6, "iq2_xxs": 6,
+        "q8_0": 1,
+        "q5_0": 2, "q5_1": 2,
+        "q4_0": 3, "q4_1": 3, "iq4_nl": 3,
     }
     CTX_OPTIONS = ["4K", "8K", "16K", "32K", "64K", "128K", "256K", "512K", "1M"]
     # Sort state per column: None / "asc" / "desc"

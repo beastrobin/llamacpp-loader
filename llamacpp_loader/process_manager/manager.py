@@ -515,10 +515,23 @@ class ProcessManager:
         # Threading
         cmd.extend(["-t", str(config.n_threads)])
 
-        # KV cache quantization
-        if config.kv_cache and config.kv_cache.lower() != "f16":
-            cmd.extend(["--cache-type-k", config.kv_cache.lower()])
-            cmd.extend(["--cache-type-v", config.kv_cache.lower()])
+        # KV cache quantization. Only the types actually accepted by
+        # llama.cpp's --cache-type-k/-v are valid; weight quant names such as
+        # q4_k are NOT kv types and make the server abort on startup (the
+        # "Unsupported cache type" error). Fall back to q4_0 instead of
+        # crashing so a bad value in settings never bricks a launch.
+        _VALID_KV = {"f16", "f32", "q8_0", "q5_0", "q5_1",
+                     "q4_0", "q4_1", "iq4_nl"}
+        if config.kv_cache:
+            kv = config.kv_cache.strip().lower()
+            if kv and kv not in _VALID_KV:
+                logger.warning(
+                    "profile %r requested unsupported KV cache type %r; "
+                    "falling back to q4_0", getattr(config, "profile_name", "?"), kv)
+                kv = "q4_0"
+            if kv and kv != "f16":
+                cmd.extend(["--cache-type-k", kv])
+                cmd.extend(["--cache-type-v", kv])
 
         # Vision projector. If the profile explicitly declares an mmproj but the
         # file is missing, FAIL LOUDLY instead of silently launching a text-only
