@@ -158,8 +158,25 @@ class MainWindow:
         """Callback invoked by ProcessManager when a new log line arrives.
 
         Thread-safe: uses root.after() to schedule on the main thread.
+        Also scans for out-of-memory signatures so an OOM failure is surfaced
+        in the Test Results panel (not just the Server Output console).
         """
         self.root.after(0, lambda: self._console_panel.append_line(line))
+        low = line.lower()
+        if any(k in low for k in (
+            "out of memory", "failed to allocate", "cuda error",
+            "not enough memory", "could not allocate", "cudamalloc",
+            "cumemalloc", "ggml_cuda_host_malloc",
+        )):
+            self.root.after(0, lambda ln=line: self._report_oom(ln))
+
+    def _report_oom(self, line: str) -> None:
+        """Surface an out-of-memory error in the Test Results panel."""
+        try:
+            self._test_panel.append_line(f"[OOM] {line}")
+            self._status_bar.set_state("error", "Out of memory - VRAM exhausted")
+        except Exception:
+            pass
 
     def _recover_existing_server(self) -> None:
         """Take ownership of a llama-server left running by a previous session.
@@ -3451,11 +3468,19 @@ class StatusBar(ttk.Frame):
         # Resource monitor (RAM / VRAM) on the RIGHT — bottom-right corner.
         # Keeps the numeric GB readout AND adds two horizontal usage bars with a
         # live percentage, so load is visible at a glance.
-        # Red "blood-bar" style for the meters (Windows themed progressbars
-        # honour the style background as the bar fill colour).
+        # Resource meter colour styles — fill colour shifts with usage level:
+        #   < 90%        -> light blue  (safe)
+        #   90% .. < 95% -> yellow       (warning)
+        #   >= 95%       -> red         (critical / OOM risk)
+        # Windows themed progressbars honour the style background as the fill.
         try:
-            ttk.Style().configure("Blood.Horizontal.TProgressbar",
-                                  background="#e53935", troughcolor="#2a1414")
+            st = ttk.Style()
+            st.configure("BloodLow.Horizontal.TProgressbar",
+                         background="#4fc3f7", troughcolor="#15242f")
+            st.configure("BloodMid.Horizontal.TProgressbar",
+                         background="#ffca28", troughcolor="#2a2410")
+            st.configure("BloodHigh.Horizontal.TProgressbar",
+                         background="#e53935", troughcolor="#2a1414")
         except Exception:
             pass
 
@@ -3474,7 +3499,7 @@ class StatusBar(ttk.Frame):
             num.pack(side=tk.LEFT, padx=(0, 4))
             bar = ttk.Progressbar(cell, orient=tk.HORIZONTAL, length=120,
                                   mode="determinate", maximum=100,
-                                  style="Blood.Horizontal.TProgressbar")
+                                  style="BloodLow.Horizontal.TProgressbar")
             bar.pack(side=tk.LEFT)
             pct = ttk.Label(cell, text="--%", width=6,
                             style="Dim.TLabel", anchor=tk.E)
@@ -3512,25 +3537,34 @@ class StatusBar(ttk.Frame):
         """Update the bottom-right RAM/VRAM usage indicator.
 
         Shows the numeric GB readout, a horizontal usage bar, and a live
-        percentage for both RAM and VRAM.
+        percentage for both RAM and VRAM. Bar colour shifts with usage:
+        <90% light blue, 90-95% yellow, >=95% red.
         """
+
+        def _style_for(pct: int) -> str:
+            if pct >= 95:
+                return "BloodHigh.Horizontal.TProgressbar"
+            if pct >= 90:
+                return "BloodMid.Horizontal.TProgressbar"
+            return "BloodLow.Horizontal.TProgressbar"
+
         if ram_total > 0:
             ram_pct = int(round(ram_used / ram_total * 100))
             self._ram_num.config(text=f"RAM {ram_used:.1f}/{ram_total:.1f}G")
-            self._ram_bar.config(value=ram_pct)
+            self._ram_bar.config(value=ram_pct, style=_style_for(ram_pct))
             self._ram_pct.config(text=f"{ram_pct}%")
         else:
             self._ram_num.config(text="RAM N/A")
-            self._ram_bar.config(value=0)
+            self._ram_bar.config(value=0, style="BloodLow.Horizontal.TProgressbar")
             self._ram_pct.config(text="N/A")
         if vram_total > 0:
             vram_pct = int(round(vram_used / vram_total * 100))
             self._vram_num.config(text=f"VRAM {vram_used:.1f}/{vram_total:.1f}G")
-            self._vram_bar.config(value=vram_pct)
+            self._vram_bar.config(value=vram_pct, style=_style_for(vram_pct))
             self._vram_pct.config(text=f"{vram_pct}%")
         else:
             self._vram_num.config(text="VRAM N/A")
-            self._vram_bar.config(value=0)
+            self._vram_bar.config(value=0, style="BloodLow.Horizontal.TProgressbar")
             self._vram_pct.config(text="N/A")
 
 
