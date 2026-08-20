@@ -2416,6 +2416,37 @@ class MainWindow:
         except OSError:
             return False
 
+    def _check_gpu_available(self) -> Optional[bool]:
+        """Probe llama.cpp for a CUDA/Vulkan device using ``--list-devices``.
+
+        Returns ``True`` when at least one GPU accelerator is visible,
+        ``False`` when the backend is missing (e.g. CUDA runtime DLLs absent,
+        which makes llama.cpp silently fall back to CPU), or ``None`` when the
+        check could not be performed (no llama-cli binary / probe failed).
+        """
+        base = self.store.get_ui_state().llama_server_path or ""
+        if not base or not os.path.isdir(base):
+            return None
+        for exe in ("llama-cli.exe", "llama-cli"):
+            candidate = os.path.join(base, exe)
+            if os.path.isfile(candidate):
+                try:
+                    proc = subprocess.run(
+                        [candidate, "--list-devices"],
+                        capture_output=True, text=True, timeout=15.0,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                except (OSError, subprocess.SubprocessError):
+                    return None
+                combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
+                if "CUDA" in combined or "Vulkan" in combined or "Metal" in combined:
+                    return True
+                if "Available devices" in combined and "(none)" in combined:
+                    return False
+                # Probe ran but output was unexpected — don't block the user.
+                return None
+        return None
+
     # ------------------------------------------------------------------ external agent launcher
     @staticmethod
     def _resolve_agent_command(command: str) -> Optional[str]:
@@ -2818,6 +2849,27 @@ class MainWindow:
                 "Manager, or run:  taskkill /f /im llama-server.exe), then start "
                 "again — or pick a different port for this profile.")
             return False
+
+        # GPU availability guard: llama.cpp silently falls back to CPU when
+        # its CUDA runtime DLLs are missing (cublas64_*.dll / cudart64_*.dll),
+        # which shows up as a 5-10x throughput drop with no error message.
+        # Warn the user before they waste minutes on a slow CPU-bound server.
+        if (profile.inference.gpu_layers or 0) > 0:
+            gpu_ok = self._check_gpu_available()
+            if gpu_ok is False:
+                self._status_bar.set_state(
+                    "error", "GPU not detected - server may run on CPU")
+                if not messagebox.askyesno(
+                        "GPU Not Detected",
+                        "llama.cpp reports NO CUDA/Vulkan GPU device available.\n\n"
+                        "This usually means the CUDA runtime DLLs "
+                        "(cublas64_*.dll / cudart64_*.dll) are missing from the "
+                        "llama.cpp folder, so inference would silently run on "
+                        "CPU at roughly 1/5 the speed.\n\n"
+                        "Continue anyway (CPU)?",
+                        icon="warning"):
+                    self._status_bar.set_state("idle", "Start aborted - GPU not detected")
+                    return False
 
         success = self.proc_mgr.start(profile)
         if not success:

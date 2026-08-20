@@ -48,14 +48,14 @@ CTX_MAX = 262144         # 256K absolute ceiling on 24 GB (verified 35B hits it)
 # mmproj pairing by model family (relative to the bin dir, must exist on disk)
 # More specific families should come first.
 MMPROJ = [
-    ("qwen3.6-35b-a3b", r"models\HauhauCS\mmproj-Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-f16.gguf"),
+    ("qwen3.6-35b-a3b", r"HauhauCS\mmproj-Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-f16.gguf"),
     # NOTE: gemma-4-26b-a4b has no official mmproj on disk yet (the 12B
     # projector is dimension-incompatible), so it is intentionally omitted here
     # and launches as a text-only model until a correct 26B projector is added.
-    ("gemma-4-12b", r"models\google\mmproj-gemma-4-12B-it-QAT-BF16.gguf"),
+    ("gemma-4-12b", r"google\mmproj-gemma-4-12B-it-QAT-BF16.gguf"),
 ]
 
-KV_TYPES = [("f16", 2), ("q8_0", 1), ("q4_0", 0.5)]
+KV_TYPES = [("q4_0", 0.5), ("q8_0", 1), ("f16", 2)]
 
 # user's verified parameters from the 2026-08-11 "Local LLM Web Launcher" list.
 # Each entry: (required stem substrings, ctx_size, kv_cache, reasoning, tag_hint)
@@ -73,8 +73,8 @@ EMPIRICAL = [
     ("qwen3.6-27b-fable-neo", 32768, "q8_0", False, ""),
     ("qwen3.6-27b-fable-mtp", 32768, "q8_0", False, ""),
     ("qwen3.6-27b-abliterated", 32768, "q8_0", False, ""),
-    ("qwen3.6-35b-a3b-iq2_m", 131072, "q8_0", False, "img"),
-    ("qwen3.6-35b-a3b-iq3_m", 262144, "q8_0", False, "img"),
+    ("qwen3.6-35b-a3b-iq2_m", 131072, "q4_0", False, "img"),
+    ("qwen3.6-35b-a3b-iq3_m", 262144, "q4_0", False, "img"),
     ("qwen3.6-35b-a3b-q4_k_m", 262144, "q4_0", False, "img"),
 ]
 
@@ -151,8 +151,10 @@ def optimize(meta, weight_mb, stem, allow_256k):
         return emp[0], emp[1]
 
     # Dynamic fallback for unknown models.
+    # KV type order is safety-first (q4_0 -> q8_0 -> f16) so dense models with
+    # large head_dim do not sit at the 24 GB edge and throttle.
     if meta["n_layers"] <= 0 or meta["n_kv"] <= 0:
-        return CTX_MIN, "q8_0"
+        return CTX_MIN, "q4_0"
     kv_elem = 2 * meta["n_layers"] * meta["n_kv"] * meta["head_dim"]
     cap = CTX_MAX if allow_256k else 131072
     targets = [t for t in (262144, 131072, 65536)

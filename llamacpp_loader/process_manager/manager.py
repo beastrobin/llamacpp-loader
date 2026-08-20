@@ -325,6 +325,11 @@ class ProcessManager:
             # previous session registered, so we can still shut it down.
             proc = self._adopt_from_registry()
             if proc is None:
+                # Registry missing/stale — scan the system for an orphan
+                # llama-server so Stop still works for servers launched
+                # outside the loader or when the registry was lost.
+                proc = self._adopt_orphan_from_scan()
+            if proc is None:
                 self._forward_log("No server handle or registry entry found.")
                 self._set_state(ProcessState.IDLE)
                 return True
@@ -372,6 +377,22 @@ class ProcessManager:
         self._forward_log(
             f"Adopting server from registry (PID {pid}, port {data.get('port')})")
         return _PidHandle(pid)
+
+    def _adopt_orphan_from_scan(self) -> Optional["_PidHandle"]:
+        """Reconnect to a live llama-server found by scanning the system.
+
+        Fallback for ``stop()`` when neither this session holds a handle nor
+        the registry has an entry — e.g. the server was launched manually or
+        the registry was lost. Mirrors the startup ``recover_any()`` scan so a
+        Stop click still terminates an orphaned server.
+        """
+        for cand in scan_llama_server_pids():
+            with self._lock:
+                self._process = _PidHandle(cand)
+            self._forward_log(
+                f"Adopting orphan llama-server from system scan (PID {cand})")
+            return _PidHandle(cand)
+        return None
 
     def recover(self) -> Optional[int]:
         """Adopt a server left running by a previous loader session.
