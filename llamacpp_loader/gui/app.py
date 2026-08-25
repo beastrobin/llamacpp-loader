@@ -3140,7 +3140,18 @@ class MainWindow:
                         data=payload.encode("utf-8"),
                         headers={"Content-Type": "application/json"},
                     )
-                    with urllib.request.urlopen(req, timeout=30) as resp:
+                    # The speed test targets the LOCAL llama-server (127.0.0.1)
+                    # started by this app, so it must NEVER go through a system
+                    # proxy. On Windows, urllib reads the WinINET proxy config
+                    # and does NOT bypass loopback addresses by default (unless
+                    # ProxyOverride contains "<local>" or NO_PROXY is set), so a
+                    # machine-wide proxy (e.g. 127.0.0.1:7890) hijacks the
+                    # request and answers 404/502 instead of forwarding it.
+                    # Use a no-proxy opener so the speed test reaches the same
+                    # local server the health check (raw socket) talks to.
+                    opener = urllib.request.build_opener(
+                        urllib.request.ProxyHandler({}))
+                    with opener.open(req, timeout=30) as resp:
                         body = resp.read().decode()
                     elapsed = _time.time() - t0
                     return parse(_json.loads(body), elapsed)
