@@ -48,6 +48,7 @@ from typing import Optional
 from llamacpp_loader import __version__ as APP_VERSION
 from llamacpp_loader.config import recommend
 from llamacpp_loader.gui import theme
+from llamacpp_loader.gui.detail_panel import ModelDetailPanel
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +132,14 @@ class MainWindow:
         self._overlay_last_click = None
 
         self._build_ui()
+        self._geometry_save_after = None
+        self._last_layout_snapshot = None
+        self.root.bind("<Configure>", self._on_root_configure, add="+")
+        # PanedWindow class bindings can consume ButtonRelease before a
+        # widget-level binding on Windows. Keep a bind_all fallback so sash
+        # positions are persisted after every completed drag.
+        self.root.bind_all("<ButtonRelease-1>", self._on_any_button_release, add="+")
+        self.root.bind_all("<B1-Motion>", self._on_any_drag, add="+")
         # Native Windows drag & drop for .gguf files (no external deps).
         self._install_drop_target()
         # One-time backfill: seed the locked "default" preset (community
@@ -138,8 +147,18 @@ class MainWindow:
         # recommendation as the live sampling for untouched models.
         self._migrate_presets()
         self._restore_window_state()
+        self.root.after_idle(self._restore_pane_state)
+        # ttk.PanedWindow can still report a 1px width during the first idle
+        # pass on Windows. A short second pass ensures Server/Test receives
+        # the stored sash after the top-level window has been mapped.
+        self.root.after(250, self._restore_pane_state)
+        self.root.after(700, self._poll_layout_state)
         self._restore_sort_state()
         self._refresh_profile_list()
+        # A newly opened loader should show the leading columns. Tk can retain
+        # a non-zero xview while restored widths and panes are being realised,
+        # which otherwise makes the list appear to reopen in the middle.
+        self.root.after(300, self._reset_initial_horizontal_views)
 
         # Adopt a server left running by a previous loader session so it is
         # not orphaned and the Stop button works. See ProcessManager.recover().
@@ -281,6 +300,13 @@ class MainWindow:
         self._build_path_row(topbar)
         self._build_toolbar(topbar)
 
+        # Give the dense two-row toolbar a clear visual boundary before the
+        # model workspace starts; previously the table header touched the six
+        # action buttons and read as a third toolbar row.
+        self._workspace_separator = ttk.Separator(
+            main, orient=tk.HORIZONTAL)
+        self._workspace_separator.pack(fill=tk.X, pady=(8, 6))
+
         # Bottom: status bar. This is packed BEFORE the expandable content area
         # so it reserves its natural height first; the PanedWindow above then
         # only claims the remaining space. Otherwise content.pack(expand=True)
@@ -301,25 +327,21 @@ class MainWindow:
         # widgets must be repainted every mouse-motion frame.
         content.configure(opaqueresize=False)
 
-        # Model list table (full width) with custom header row for Selected label
-        table_frame = ttk.Frame(content)
+        # Model list + model details. Use the same ttk pane implementation as
+        # Server/Test so both horizontal splitters have identical visuals and
+        # hit targets on Windows.
+        upper = ttk.PanedWindow(content, orient=tk.HORIZONTAL)
+        self._upper_pane = upper
+        self._content_pane = content
 
-        # Header row: title + Selected label (kept tight to the table below)
-        header_row = ttk.Frame(table_frame)
-        header_row.pack(side=tk.TOP, fill=tk.X, pady=(0, 2))
+        # PanedWindow children must be created with the PanedWindow itself as
+        # their parent.  Parenting these frames to ``content`` leaves the panes
+        # unmapped on Windows/Tk, producing a completely blank upper section.
+        table_frame = ttk.Frame(upper)
+        self._table_frame = table_frame
 
-        title_label = ttk.Label(header_row, text="Model List",
-                                 background=theme.CARD, foreground=theme.TEXT,
-                                 font=("Microsoft YaHei UI", 10, "bold"))
-        title_label.pack(side=tk.LEFT, padx=(8, 12), pady=(0, 0))
-
-        self._model_list_selected_label = ttk.Label(header_row, text="Selected: ",
-                                                    style="Dim.TLabel")
-        self._model_list_selected_label.pack(side=tk.LEFT, padx=(0, 0), pady=(0, 0))
-
-        # Treeview lives in the remaining area. A plain Frame (not a LabelFrame
-        # with an empty title) avoids the extra blank row between the "Model
-        # List" header and the table.
+        # The Model column and the detail-panel title already communicate the
+        # list/selection state, so no duplicate "Model List / Selected" banner.
         tree_container = ttk.Frame(table_frame)
         tree_container.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
@@ -331,8 +353,18 @@ class MainWindow:
 
         self._build_model_table(tree_container)
 
-        # Add table and console areas to the vertical splitter.
-        content.add(table_frame, stretch="always", minsize=200)
+        detail_frame = ttk.Frame(upper, padding=(10, 0, 0, 0))
+        self._detail_frame = detail_frame
+        self._detail_panel = ModelDetailPanel(
+            detail_frame, on_change=self._on_detail_change,
+            on_preset=self._on_detail_preset,
+            on_action=self._on_detail_action)
+        self._detail_panel.pack(fill=tk.BOTH, expand=True)
+
+        # Add table/details and console areas to the vertical splitter.
+        upper.add(table_frame, weight=1)
+        upper.add(detail_frame, weight=1)
+        content.add(upper, stretch="always", minsize=260)
 
         # Console area split: Server Output (left, ~2/3) + Test Results (right, ~1/3)
         # Keep ttk.PanedWindow here: the stock Windows Tk in this Python build does
@@ -341,6 +373,7 @@ class MainWindow:
         # vertical list/console splitter (handled above), so the horizontal pane
         # can stay on ttk.
         console_pane = ttk.PanedWindow(content, orient=tk.HORIZONTAL)
+        self._console_pane = console_pane
 
         server_frame = ttk.LabelFrame(console_pane, text="Server Output",
                                       padding=6, style="Card.TLabelframe")
@@ -354,6 +387,10 @@ class MainWindow:
         self._test_panel.pack(fill=tk.BOTH, expand=True)
         console_pane.add(test_frame, weight=1)
         content.add(console_pane, stretch="always", minsize=120)
+        # Save splitter positions as soon as a drag is released.
+        upper.bind("<ButtonRelease-1>", lambda _e: self._save_pane_state())
+        content.bind("<ButtonRelease-1>", lambda _e: self._save_pane_state())
+        console_pane.bind("<ButtonRelease-1>", lambda _e: self._save_pane_state())
 
         # Friendly placeholder text so empty panels don't look broken
         self._console_panel.append_line(
@@ -366,40 +403,27 @@ class MainWindow:
 
     # Column layout (order = Treeview column order).
     # Order note: "speed" sits directly LEFT of "kv"; "size" is left of "quant".
-    TABLE_COLUMNS = ("model", "size", "quant", "speed", "inf_group", "kv", "ctx",
-                     "reasoning", "gpu", "threads", "mtp", "dflash", "vision",
-                     "sam_group", "temp", "topk", "topp", "rp", "presets")
+    # Keep the overview table focused on model selection. Tunable values are
+    # edited in ModelDetailPanel instead of a 19-column spreadsheet layout.
+    TABLE_COLUMNS = ("model", "size", "quant", "speed", "status", "presets")
     TABLE_HEADINGS = {
         "model": "Model",
         "size": "Size",
         "quant": "Quant",
-        "kv": "KV Cache",
-        "ctx": "Ctx",
         "speed": "Speed",
-        "reasoning": "Thinking",
-        "gpu": "GPU Layers",
-        "threads": "Threads",
-        "temp": "Temp",
-        "topk": "Top-K",
-        "topp": "Top-P",
-        "rp": "Repeat",
-        "vision": "Vision",
-        "mtp": "MTP",
-        "dflash": "DFlash",
+        "status": "Status",
         "presets": "Presets",
         # Group toggle columns — blank data columns that fold their group.
         "inf_group": "Inference",
         "sam_group": "Sampling",
     }
     # Inference group = server-adjacent execution knobs; Sampling group = generation knobs
-    INFERENCE_COLS = {"kv", "ctx", "reasoning", "gpu", "threads", "mtp", "dflash", "vision"}
-    SAMPLING_COLS = {"temp", "topk", "topp", "rp"}
+    INFERENCE_COLS = set()
+    SAMPLING_COLS = set()
     # Column widths: Model gets a generous width; sampling cols are narrow numbers
     TABLE_WIDTHS = {
-        "model": 300, "size": 90, "quant": 78, "speed": 66, "inf_group": 70,
-        "kv": 70, "ctx": 64, "reasoning": 68, "gpu": 58, "threads": 58,
-        "sam_group": 70, "temp": 52, "topk": 52, "topp": 52, "rp": 56,
-        "vision": 52, "mtp": 56, "dflash": 56, "presets": 96,
+        "model": 300, "size": 90, "quant": 78, "speed": 72,
+        "status": 150, "presets": 96,
     }
     # Per-column header background/foreground for the custom (non-ttk) header row.
     # Inference columns get a blue tint, Sampling columns an amber tint, the rest
@@ -437,6 +461,7 @@ class MainWindow:
         "kv": "KV Cache",
         "ctx": "Ctx",
         "speed": "Speed",
+        "status": "Status",
         "reasoning": "Thinking",
         "gpu": "GPU Layers",
         "threads": "Threads",
@@ -453,6 +478,9 @@ class MainWindow:
         "sam_group": "Sampling",
     }
     # Which columns get a numeric inline-edit on double click
+    # Kept for compatibility with the legacy inline-editor helpers and tests.
+    # These columns are no longer rendered in the overview table; the detail
+    # panel is the user-facing editor.
     EDITABLE_COLS = {"quant", "kv", "ctx", "gpu", "threads", "temp", "topk", "topp", "rp"}
     # Only the *sampling* parameters are governed by the preset and subject to
     # the "default is locked" rule. Model-level inference knobs (kv / ctx /
@@ -547,8 +575,11 @@ class MainWindow:
             else:
                 lbl.place(x=x, y=0, width=w, height=26)
                 if rsz is not None:
-                    rsz.place(x=x + w - 2, y=0)
+                    rsz.place(x=x + w - 3, y=0)
                 x += w
+        self._header_inner.configure(width=x, height=26)
+        self._header_canvas.itemconfigure(
+            self._header_window, width=x, height=26)
         self._header_canvas.config(scrollregion=(0, 0, x, 26))
 
     def _start_col_resize(self, col: str, event: tk.Event) -> None:
@@ -570,6 +601,7 @@ class MainWindow:
 
     def _end_col_resize(self, _event: tk.Event | None = None) -> None:
         """Finish a column resize and clear the drag state."""
+        self.root.after_idle(self._save_table_column_widths)
         self._resize_col = None
         self._resize_start_x = 0
         self._resize_start_w = 0
@@ -610,11 +642,13 @@ class MainWindow:
                   foreground=[("selected", "#ffffff")])
 
         self._tree = ttk.Treeview(
-            parent, columns=columns, show="tree", height=8,
+            parent, columns=columns, show="", height=8,
             style="NoHead.Treeview")
-        # We render our own coloured header on a Canvas above the tree. Using
-        # show="tree" hides the native heading row; the tree column itself is
-        # collapsed to zero width so only the data columns remain visible.
+        # We render our own coloured header on a Canvas above the tree. An
+        # empty ``show`` value removes both the native heading row and the
+        # unused tree column while keeping the configured data columns visible.
+        # Using ``show='headings'`` here leaves a blank native heading row under
+        # the custom header on Windows, which looks like a phantom model row.
         self._tree.column("#0", width=0, minwidth=0, stretch=False)
         for col in columns:
             # Heading command is kept for keyboard/screen-reader activation,
@@ -624,6 +658,13 @@ class MainWindow:
             anchor = tk.W if col == "model" else tk.CENTER
             self._tree.column(col, width=self.TABLE_WIDTHS[col], anchor=anchor,
                               stretch=False, minwidth=40)
+        saved_widths = self.store.get_ui_state().table_column_widths
+        for col, width in saved_widths.items():
+            if col in columns:
+                try:
+                    self._tree.column(col, width=max(40, int(width)))
+                except (TypeError, ValueError, tk.TclError):
+                    pass
 
         # Keep group sets referenced for downstream consumers (future styling)
         _ = self.INFERENCE_COLS, self.SAMPLING_COLS  # noqa: F841
@@ -647,6 +688,11 @@ class MainWindow:
         # --- custom coloured header (Canvas, scrolls in sync with the tree) ---
         self._header_canvas = tk.Canvas(parent, height=26, bg=theme.CARD,
                                         highlightthickness=0)
+        self._header_inner = tk.Frame(
+            self._header_canvas, height=26, bg=theme.CARD,
+            highlightthickness=0, borderwidth=0)
+        self._header_window = self._header_canvas.create_window(
+            0, 0, anchor=tk.NW, window=self._header_inner)
         self._header_labels: dict[str, tk.Label] = {}
         self._header_resizers: dict[str, tk.Frame] = {}
         # Track an active column resize so the mouse can stray past the handle.
@@ -674,22 +720,30 @@ class MainWindow:
                 text = self.HEADING_LABELS[col]
                 font = theme.FONT_SMALL
                 cmd = lambda e, c=col: self._sort_by_column(c)
-            lbl = tk.Label(self._header_canvas, text=text, bg=bg, fg=fg,
+            lbl = tk.Label(self._header_inner, text=text, bg=bg, fg=fg,
                            font=font, anchor=tk.CENTER, cursor="hand2")
-            w = self.TABLE_WIDTHS[col]
+            # The body may use widths restored from the previous session;
+            # always derive the custom header from the actual Treeview width.
+            w = self._tree.column(col, "width") or self.TABLE_WIDTHS[col]
             lbl.place(x=total_w, y=0, width=w, height=26)
             lbl.bind("<Button-1>", cmd)
             self._header_labels[col] = lbl
 
-            # Thin resize handle on the right edge of each header cell.
-            rsz = tk.Frame(self._header_canvas, width=4, height=26, bg=bg,
+            # Visible resize handle on the right edge of each header cell.
+            rsz = tk.Frame(self._header_inner, width=6, height=26,
+                           bg=theme.BORDER,
                            cursor="sb_h_double_arrow")
-            rsz.place(x=total_w + w - 2, y=0)
+            rsz.place(x=total_w + w - 3, y=0)
             rsz.bind("<Button-1>", lambda e, c=col: self._start_col_resize(c, e))
             rsz.bind("<B1-Motion>", self._do_col_resize)
             rsz.bind("<ButtonRelease-1>", self._end_col_resize)
+            rsz.bind("<Enter>", lambda _e, widget=rsz: widget.configure(bg=theme.TAB_HOVER))
+            rsz.bind("<Leave>", lambda _e, widget=rsz: widget.configure(bg=theme.BORDER))
             self._header_resizers[col] = rsz
             total_w += w
+        self._header_inner.configure(width=total_w, height=26)
+        self._header_canvas.itemconfigure(
+            self._header_window, width=total_w, height=26)
         self._header_canvas.config(scrollregion=(0, 0, total_w, 26))
 
         self._vsb = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=self._tree.yview)
@@ -706,12 +760,10 @@ class MainWindow:
 
         # Horizontal scrollbar: columns can exceed window width. Dragging it
         # scrolls the tree AND the custom header canvas in lockstep.
-        self._hsb = ttk.Scrollbar(parent, orient=tk.HORIZONTAL, command=self._tree.xview)
+        self._hsb = ttk.Scrollbar(
+            parent, orient=tk.HORIZONTAL, command=self._scroll_table_x)
         self._tree.configure(
-            xscrollcommand=lambda *a: (self._hsb.set(*a),
-                                       self._header_canvas.xview_moveto(
-                                           self._tree.xview()[0]),
-                                       self._refresh_changed_overlays()))
+            xscrollcommand=self._on_table_xview)
         self._hsb.pack(side=tk.BOTTOM, fill=tk.X)
 
         self._tree.pack(fill=tk.BOTH, expand=True)
@@ -730,6 +782,32 @@ class MainWindow:
         self._edit_entry: Optional[tk.Widget] = None
         self._edit_row: Optional[str] = None
         self._edit_col: Optional[str] = None
+
+    def _scroll_table_x(self, *args) -> None:
+        """Drive the model rows and custom heading as one horizontal view."""
+        self._tree.xview(*args)
+        # _on_table_xview receives the actual Treeview position. Do not issue
+        # the same command independently to the header: at a scroll limit it
+        # can move the header while the data area remains stationary.
+        self._refresh_changed_overlays()
+
+    def _reset_initial_horizontal_views(self) -> None:
+        """Reset startup-only horizontal offsets after all geometry settles."""
+        try:
+            self._tree.xview_moveto(0)
+            self._header_canvas.xview_moveto(0)
+        except (AttributeError, tk.TclError):
+            return
+        try:
+            self._detail_panel._canvas.xview_moveto(0)
+        except (AttributeError, tk.TclError):
+            pass
+
+    def _on_table_xview(self, first: str, last: str) -> None:
+        """Keep the header aligned when Treeview scrolls by any mechanism."""
+        self._hsb.set(first, last)
+        self._header_canvas.xview_moveto(float(first))
+        self._refresh_changed_overlays()
 
     # ---------------------------------------------------------------- clicks
     def _col_index(self, col_id: str) -> int:
@@ -765,6 +843,9 @@ class MainWindow:
                 self._toggle_reasoning(row_id)
         elif col == "vision":
             self._attach_vision_model(row_id)
+        elif col == "gpu":
+            if event.num == 3:  # right-click => CPU-MoE mode menu
+                self._cpu_moe_menu(row_id, event.x_root, event.y_root)
         elif col == "mtp":
             self._open_mtp_menu(row_id)
         elif col == "dflash":
@@ -823,6 +904,67 @@ class MainWindow:
             return
         self.store.update(name, {"reasoning": not profile.reasoning})
         self._refresh_model_table(self.store.list_profiles())
+
+    def _cpu_moe_menu(self, name: str, x_root: int, y_root: int) -> None:
+        """Right-click the GPU Layers cell: pick the MoE offload mode.
+
+        Off            -- experts live in VRAM (default, fastest on big cards)
+        All in RAM     -- --cpu-moe: every expert weight stays in system RAM,
+                          only attention uses the GPU (lowest VRAM, slowest)
+        First N layers -- --n-cpu-moe N: keep the first N layers' experts in
+                          RAM, the rest ride the GPU (middle ground; tune N)
+        Only meaningful for MoE models -- dense models are refused.
+        """
+        profile = self.store.load(name)
+        if not profile:
+            return
+        from llamacpp_loader.config.metadata import looks_moe_from_name
+        if not (profile.is_moe or looks_moe_from_name(profile.gguf_file)):
+            messagebox.showinfo(
+                "Not a MoE Model",
+                f"{profile.display_name} is not a Mixture-of-Experts model, "
+                "so MoE expert offload has no effect.")
+            return
+        menu = tk.Menu(self.root, tearoff=0)
+
+        def apply(mode: str, n: int = 0) -> None:
+            if mode == "all":
+                self.store.update(name, {"cpu_moe": True, "n_cpu_moe": 0})
+                tag = "ALL experts in RAM (--cpu-moe)"
+            elif mode == "first_n":
+                self.store.update(name, {"cpu_moe": False, "n_cpu_moe": n})
+                tag = f"first {n} layers' experts in RAM (--n-cpu-moe {n})"
+            else:
+                self.store.update(name, {"cpu_moe": False, "n_cpu_moe": 0})
+                tag = "experts in VRAM"
+            self._console_panel.append_line(
+                f"▶ CPU-MoE: {tag} for {profile.display_name}")
+            self._refresh_model_table(self.store.list_profiles())
+
+        menu.add_command(label="Off - experts in VRAM (fastest)",
+                         command=lambda: apply("off"))
+        menu.add_command(label="All experts in RAM (--cpu-moe, lowest VRAM)",
+                         command=lambda: apply("all"))
+        menu.add_command(label="First N layers' experts in RAM (--n-cpu-moe N)...",
+                         command=self._cpu_moe_ask_n(name, apply))
+        menu.tk_popup(x_root, y_root)
+
+    def _cpu_moe_ask_n(self, name: str, apply):
+        """Return a no-arg callback that prompts for N and applies it."""
+        from tkinter import simpledialog
+
+        def _ask() -> None:
+            n = simpledialog.askinteger(
+                "CPU-MoE First N Layers",
+                "Keep the MoE experts of the first N layers in system RAM.\n\n"
+                "Smaller N = more experts on GPU = faster but more VRAM.\n"
+                "Larger N = more experts in RAM = slower but less VRAM.\n\n"
+                "(Qwen3.6-35B-A3B has 40 layers; try ~15-20 first.)",
+                parent=self.root, minvalue=1, maxvalue=999, initialvalue=20)
+            if n:
+                apply("first_n", n)
+
+        return _ask
 
     def _toggle_reasoning_forced(self, name: str) -> None:
         """Right-click the Thinking cell to lock/unlock Thinking (forced ON).
@@ -1345,7 +1487,6 @@ class MainWindow:
             return
         name = sel[0]  # iid is profile_name
         self._selected_profile_name = name
-        self._update_toolbar_profile_label(name)
         self._highlight_selected_row(name)
         self._on_profile_selected(None)
 
@@ -1478,18 +1619,15 @@ class MainWindow:
     def _set_toolbar_running(self, running: bool) -> None:
         """Toggle Start/Stop/Restart button states in the toolbar."""
         if running:
-            self._toolbar_start_btn.config(state=tk.DISABLED)
+            # The same button is useful after startup: open the already-running
+            # local Web UI instead of attempting a second server launch.
+            self._toolbar_start_btn.config(state=tk.NORMAL, text="Open Web")
             self._toolbar_stop_btn.config(state=tk.NORMAL)
             self._toolbar_restart_btn.config(state=tk.NORMAL)
         else:
-            self._toolbar_start_btn.config(state=tk.NORMAL)
+            self._toolbar_start_btn.config(state=tk.NORMAL, text="Start Server")
             self._toolbar_stop_btn.config(state=tk.DISABLED)
             self._toolbar_restart_btn.config(state=tk.DISABLED)
-
-    def _update_toolbar_profile_label(self, name: str) -> None:
-        """Update the model-selection label on the Model List header."""
-        if hasattr(self, "_model_list_selected_label"):
-            self._model_list_selected_label.config(text=f"Selected: {name}")
 
     def _remove_selected_model(self) -> None:
         """Delete the currently selected model profile from the store."""
@@ -1555,7 +1693,6 @@ class MainWindow:
                 profiles[0],
             )
             self._selected_profile_name = default_name
-            self._update_toolbar_profile_label(self._selected_profile_name)
             self._on_profile_selected(None)
 
     def _refresh_model_table(self, profiles: list[str]) -> None:
@@ -1630,26 +1767,16 @@ class MainWindow:
             if profile.is_moe:
                 model_disp = f"{model_disp} [MoE]"
 
+            status_str = "Running" if getattr(self, "_running_profile_name", "") == name else "Ready"
+            if not profile.gguf_file or not profile.model_path:
+                status_str = "Needs model"
             self._tree.insert(
                 "", tk.END, iid=name, values=(
                     model_disp,
                     size_str,
                     profile.quant or "",
                     f"{profile.speed:.1f}" if profile.speed > 0 else "",
-                    "",                              # inf_group: blank fold toggle
-                    profile.kv_cache or "f16",
-                    ctx_str,
-                    think_str,
-                    inf.gpu_layers,
-                    inf.n_threads,
-                    mtp_str,
-                    dflash_str,
-                    vision_str,
-                    "",                              # sam_group: blank fold toggle
-                    f"{sam.temperature:.2f}",
-                    sam.top_k,
-                    f"{sam.top_p:.2f}",
-                    f"{sam.repeat_penalty:.2f}",
+                    status_str,
                     presets_str,
                 ),
                 tags=(f"row_{'even' if row_index % 2 == 0 else 'odd'}.Treeview",),
@@ -1693,8 +1820,7 @@ class MainWindow:
         return self.KV_RANK.get((kv or "").lower(), 99)
 
     # Columns whose cell turns green when the value differs from the default.
-    CHANGED_COLS = ("kv", "ctx", "reasoning", "gpu", "threads", "mtp",
-                    "temp", "topk", "topp", "rp")
+    CHANGED_COLS = ()
 
     def _default_param_values(self) -> dict:
         """Baseline parameter values used to detect user changes."""
@@ -1854,6 +1980,16 @@ class MainWindow:
     def _update_resources(self) -> None:
         """Poll system RAM/VRAM usage, update the status bar, reschedule."""
         ram_u, ram_t, vram_u, vram_t = self._read_resources()
+        # A process can exit outside the GUI (crash, task manager, another
+        # launcher). Reconcile the row state during the same periodic poll so
+        # the table never remains green/"Running" after the server is gone.
+        try:
+            if self._running_profile_name and not self.proc_mgr.is_running():
+                self._running_profile_name = ""
+                self._set_toolbar_running(False)
+                self._refresh_model_table(self.store.list_profiles())
+        except Exception:
+            logger.debug("Could not reconcile server row state", exc_info=True)
         try:
             self._status_bar.set_resources(ram_u, ram_t, vram_u, vram_t)
         except Exception:
@@ -2037,6 +2173,8 @@ class MainWindow:
         if col == "kv":
             # Sort by KV-cache compression level (f16 = least compressed).
             return self._kv_rank(profile.kv_cache or "f16")
+        if col == "status":
+            return 2 if getattr(self, "_running_profile_name", "") == name else (0 if profile.gguf_file else -1)
         if col in NUMERIC_COLS:
             return getattr(profile.inference if col in ("gpu", "threads") else profile.sampling,
                            col)
@@ -2352,7 +2490,9 @@ class MainWindow:
             logger.warning("Profile %s not found", name)
             return
 
-        # Update port indicator to match selected profile
+        # Update the detail editor and port indicator to match selected profile.
+        if hasattr(self, "_detail_panel"):
+            self._detail_panel.set_profile(profile)
         self._active_port = profile.server.port
         self._status_bar.set_port(profile.server.port)
         # Show the PID of any server already running for this/other profile.
@@ -2361,6 +2501,107 @@ class MainWindow:
         # Treeview selection and makes the active row look un-highlighted.
         # Just re-stamp the selection highlight.
         self._highlight_selected_row(name)
+
+    def _on_detail_change(self, name: str, updates: dict) -> None:
+        """Persist a detail-panel edit and refresh the compact overview."""
+        if not name or not updates:
+            return
+        try:
+            self.store.update(name, updates)
+            self._refresh_model_table(self.store.list_profiles())
+            updated = self.store.load(name)
+            if updated and hasattr(self, "_detail_panel"):
+                # Recalculate the visible VRAM budget immediately after edits
+                # to Context, KV cache, GPU layers, batch or parallelism.
+                self._detail_panel.set_profile(updated)
+            self._status_bar.set_state("idle", "Configuration saved — restart required")
+        except (TypeError, ValueError) as exc:
+            logger.warning("Invalid detail-panel value: %s", exc)
+
+    def _on_detail_preset(self, name: str, preset: str) -> None:
+        """Apply a preset from the model detail panel."""
+        self._apply_preset(name, preset)
+        self._load_profile_to_ui(name)
+
+    def _on_detail_action(self, name: str, action: str) -> None:
+        """Route advanced capability actions from the detail panel."""
+        if action in ("vision", "vision_pick"):
+            self._pick_vision_file(name)
+        elif action == "vision_clear":
+            self._detach_vision_model(name)
+        elif action in ("mtp", "mtp_pick"):
+            self._pick_mtp_file(name)
+        elif action == "mtp_clear":
+            self._detach_mtp_model(name)
+        elif action in ("dflash", "dflash_pick"):
+            self._pick_dflash_file(name)
+        elif action == "dflash_clear":
+            self._detach_dflash_model(name)
+        elif action == "cpu_moe":
+            self._cpu_moe_menu(name, self.root.winfo_pointerx(), self.root.winfo_pointery())
+        elif action == "recommend":
+            self._recommend_gpu_layers(name)
+            return
+        self._load_profile_to_ui(name)
+
+    def _recommend_gpu_layers(self, name: str) -> None:
+        """Calculate a safe layer count off the Tk thread and update the UI."""
+        from llamacpp_loader.config.budget import estimate_vram, recommend_gpu_layers
+
+        self._status_bar.set_state("idle", "Reading GGUF metadata and estimating GPU layers…")
+
+        def worker() -> None:
+            profile = self.store.load(name)
+            if not profile:
+                result = (None, None, "Model profile not found")
+            else:
+                profile = self._ensure_profile_metadata(profile)
+                _, _, used, total = self._read_resources()
+                free_mb = max(0.0, (total - used) * 1024)
+                if free_mb <= 0:
+                    result = (None, None, "VRAM unavailable — check nvidia-smi, then try Recommend again")
+                else:
+                    layers = recommend_gpu_layers(profile, free_mb)
+                    if layers is None:
+                        result = (None, None, "No safe layer recommendation for the available VRAM")
+                    else:
+                        estimate = estimate_vram(profile, gpu_layers=layers)
+                        result = (layers, estimate.total_mb,
+                                  f"Recommended GPU layers: {layers} · estimated VRAM {estimate.total_mb / 1024:.1f} GB")
+
+            def finish() -> None:
+                layers, _estimate_mb, message = result
+                if layers is not None:
+                    self.store.update(name, {"inference.gpu_layers": layers})
+                self._status_bar.set_state("idle", message)
+                self._load_profile_to_ui(name)
+
+            self.root.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _ensure_profile_metadata(self, profile):
+        """Best-effort refresh of GGUF layer/context metadata on demand."""
+        if getattr(profile, "n_layers", 0):
+            return profile
+        try:
+            from llamacpp_loader.config.metadata import read_gguf_meta
+            path = os.path.join(profile.model_path, profile.gguf_file)
+            meta = read_gguf_meta(path)
+            if not meta.get("ok"):
+                return profile
+            updates = {}
+            for key in ("n_layers", "context_length", "is_moe",
+                        "mtp_supported", "mtp_native"):
+                value = meta.get(key)
+                if value:
+                    updates[key] = value
+            if updates:
+                self.store.update(profile.profile_name, updates)
+                return self.store.load(profile.profile_name) or profile
+        except Exception:
+            logger.exception("Could not refresh GGUF metadata for %s", profile.profile_name)
+        return profile
 
     def _restore_window_state(self) -> None:
         """Restore saved window dimensions and position.
@@ -2376,6 +2617,146 @@ class MainWindow:
         self.root.minsize(MIN_W, MIN_H)
         self.root.geometry(f"{w}x{h}")
 
+    def _on_root_configure(self, event) -> None:
+        """Persist a settled window resize without writing on every repaint."""
+        if event.widget is not self.root:
+            return
+        if self._geometry_save_after is not None:
+            try:
+                self.root.after_cancel(self._geometry_save_after)
+            except tk.TclError:
+                pass
+        self._geometry_save_after = self.root.after(350, self._save_layout_state)
+
+    def _save_layout_state(self) -> None:
+        self._geometry_save_after = None
+        self.save_window_state()
+
+    def _on_any_button_release(self, event) -> None:
+        """Persist layout after a sash or custom column drag completes."""
+        # The release event may be reported by an internal sash child (or the
+        # root) rather than the PanedWindow itself. Delay until Tk has applied
+        # the final sash position, then save all layout values together.
+        self.root.after_idle(self._save_layout_state)
+
+    def _on_any_drag(self, _event) -> None:
+        """Debounced persistence while a native sash is being dragged."""
+        if self._geometry_save_after is not None:
+            try:
+                self.root.after_cancel(self._geometry_save_after)
+            except tk.TclError:
+                pass
+        self._geometry_save_after = self.root.after(120, self._save_layout_state)
+
+    def _save_table_column_widths(self) -> None:
+        """Persist user-selected table widths for the next launch."""
+        try:
+            widths = {col: int(self._tree.column(col, "width"))
+                      for col in self.TABLE_COLUMNS}
+            self.store.set_ui_state(table_column_widths=widths)
+        except (AttributeError, tk.TclError, TypeError, ValueError):
+            logger.debug("Could not save table column widths", exc_info=True)
+
+    @staticmethod
+    def _safe_ratio(value, default: float) -> float:
+        try:
+            return min(0.9, max(0.1, float(value)))
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _pane_sash_position(pane):
+        """Read a sash position from either Tk or ttk PanedWindow."""
+        if hasattr(pane, "sashpos"):
+            return pane.sashpos(0)
+        coords = pane.sash_coord(0)
+        return coords[0] if str(pane.cget("orient")) == tk.HORIZONTAL else coords[1]
+
+    @staticmethod
+    def _set_pane_sash_position(pane, position: int) -> None:
+        """Set a sash position across Tk/ttk PanedWindow APIs."""
+        if hasattr(pane, "sashpos"):
+            pane.sashpos(0, position)
+        elif str(pane.cget("orient")) == tk.HORIZONTAL:
+            pane.sash_place(0, position, 0)
+        else:
+            pane.sash_place(0, 0, position)
+
+    def _restore_pane_state(self) -> None:
+        """Restore the three splitter positions after geometry is realised."""
+        ui = self.store.get_ui_state()
+        for pane, ratio in (
+            (self._upper_pane, self._safe_ratio(ui.upper_sash_ratio, 0.50)),
+            (self._content_pane, self._safe_ratio(ui.content_sash_ratio, 0.68)),
+            (self._console_pane, self._safe_ratio(ui.console_sash_ratio, 0.67)),
+        ):
+            try:
+                horizontal = str(pane.cget("orient")) == tk.HORIZONTAL
+                size = pane.winfo_width() if horizontal else pane.winfo_height()
+                if size > 0:
+                    self._set_pane_sash_position(pane, int(size * ratio))
+            except (AttributeError, tk.TclError, ValueError):
+                logger.debug("Could not restore pane position", exc_info=True)
+
+    def _save_pane_state(self) -> None:
+        """Save splitter positions as ratios so they survive window resizing."""
+        values = self._layout_snapshot()
+        if not values:
+            return
+        self.store.set_ui_state(**values)
+        self._last_layout_snapshot = values
+
+    def _layout_snapshot(self):
+        """Read the realized window, pane and table geometry."""
+        values = {}
+        try:
+            size_part = self.root.geometry().split("+")[0]
+            values["window_width"], values["window_height"] = map(int, size_part.split("x"))
+        except (ValueError, IndexError, tk.TclError):
+            pass
+        for key, pane in (
+            ("upper_sash_ratio", self._upper_pane),
+            ("content_sash_ratio", self._content_pane),
+            ("console_sash_ratio", self._console_pane),
+        ):
+            try:
+                horizontal = str(pane.cget("orient")) == tk.HORIZONTAL
+                size = pane.winfo_width() if horizontal else pane.winfo_height()
+                if size > 0:
+                    # Child geometry is the rendered truth. In nested Tk/ttk
+                    # panes, sashpos() can still expose the default weight
+                    # after a drag even though the child widths changed.
+                    panes = pane.panes()
+                    if panes:
+                        first = pane.nametowidget(panes[0])
+                        used = first.winfo_width() if horizontal else first.winfo_height()
+                        if used > 0:
+                            values[key] = used / size
+                    if key not in values:
+                        values[key] = self._pane_sash_position(pane) / size
+            except (AttributeError, tk.TclError, ValueError):
+                pass
+        try:
+            values["table_column_widths"] = {
+                col: int(self._tree.column(col, "width"))
+                for col in self.TABLE_COLUMNS
+            }
+        except (AttributeError, tk.TclError, TypeError, ValueError):
+            pass
+        return values
+
+    def _poll_layout_state(self) -> None:
+        """Capture layout changes even when Tk consumes sash mouse events."""
+        try:
+            current = self._layout_snapshot()
+            if current and current != self._last_layout_snapshot:
+                self.store.set_ui_state(**current)
+                self._last_layout_snapshot = current
+        except Exception:
+            logger.debug("Could not poll layout state", exc_info=True)
+        if getattr(self, "root", None) is not None:
+            self.root.after(500, self._poll_layout_state)
+
     def save_window_state(self) -> None:
         """Save current window state to ConfigStore before exit."""
         try:
@@ -2383,6 +2764,8 @@ class MainWindow:
             size_part = geom.split("+")[0]
             w, h = map(int, size_part.split("x"))
             self.store.set_ui_state(window_width=w, window_height=h)
+            self._save_pane_state()
+            self._save_table_column_widths()
         except (ValueError, IndexError):
             pass  # Ignore parse errors on exit
 
@@ -2882,6 +3265,55 @@ class MainWindow:
                     self._status_bar.set_state("idle", "Start aborted - GPU not detected")
                     return False
 
+        # MoE-aware VRAM suggestion (FreeToken-style "experts in RAM"):
+        # when the model is MoE and its GGUF size exceeds the currently free
+        # VRAM, offer to keep the expert weights in system RAM (--cpu-moe) so
+        # only the small attention part uses the GPU. This lets a Q4_K_M MoE
+        # quant run on low-VRAM cards (e.g. 35B-A3B on a 12GB laptop) that
+        # would otherwise fail or crawl. The choice is persisted per profile.
+        # Fall back to filename hints: profiles registered before MoE
+        # detection worked (or when the optional `gguf` package is missing)
+        # carry is_moe=False even for models like Qwen3.6-35B-A3B.
+        try:
+            from llamacpp_loader.config.metadata import looks_moe_from_name
+            is_moe_model = bool(getattr(profile, "is_moe", False)) or looks_moe_from_name(
+                getattr(profile, "gguf_file", "") or "")
+        except Exception:  # noqa: BLE001
+            is_moe_model = bool(getattr(profile, "is_moe", False))
+
+        if is_moe_model and not getattr(profile, "cpu_moe", False):
+            try:
+                model_gb = self._model_size_bytes(profile) / (1024 ** 3)
+                _, _, vram_used, vram_total = self._read_resources()
+                vram_free = vram_total - vram_used
+                # Fallback: the VRAM probe can fail (nvidia-smi missing, blocked
+                # or timing out). That must NOT silently skip the suggestion --
+                # fall back to "any MoE model >= 8 GB probably does not fit".
+                vram_known = vram_free > 0
+                too_big = (model_gb > vram_free + 1.0 if vram_known
+                           else model_gb >= 8.0)
+                logger.info(
+                    "cpu-moe check: model=%.2fGB vram_free=%.2fGB "
+                    "vram_known=%s too_big=%s", model_gb, vram_free,
+                    vram_known, bool(too_big))
+                if model_gb > 0 and too_big:
+                    if messagebox.askyesno(
+                            "VRAM Too Small - Enable CPU-MoE?",
+                            f"{profile.display_name} is a MoE model "
+                            f"({model_gb:.1f} GB), but only ~{vram_free:.1f} GB "
+                            "of VRAM is free.\n\n"
+                            "Keep the MoE experts in system RAM (--cpu-moe) so "
+                            "only attention layers use the GPU? This lets the "
+                            "model run on low VRAM at the cost of some speed.\n\n"
+                            "The setting will be saved for this model.",
+                            icon="warning"):
+                        profile.cpu_moe = True
+                        self.store.update(profile.profile_name, {"cpu_moe": True})
+                        self._console_panel.append_line(
+                            "▶ CPU-MoE enabled: experts stay in RAM (--cpu-moe)")
+            except Exception:
+                logger.exception("cpu-moe suggestion failed")
+
         success = self.proc_mgr.start(profile)
         if not success:
             self._status_bar.set_state("error", "Failed to start server")
@@ -2915,6 +3347,10 @@ class MainWindow:
 
     def _on_start(self) -> None:
         """Start the server with the currently selected profile."""
+        if self.proc_mgr.is_running():
+            self._open_browser(getattr(self, "_active_port", 8080))
+            self._status_bar.set_state("running", f"Server ready on port {getattr(self, '_active_port', 8080)}")
+            return
         profile = self._get_selected_profile()
         if profile is None:
             return
@@ -3010,6 +3446,9 @@ class MainWindow:
         self._set_toolbar_running(False)
         # Drop the running highlight.
         self._running_profile_name = ""
+        # Status is derived while repopulating rows; refresh now so a stopped
+        # server cannot leave a stale "Running" value visible in the table.
+        self._refresh_model_table(self.store.list_profiles())
         self._highlight_selected_row(self._selected_profile_name)
 
     def _on_restart(self) -> None:
@@ -3234,6 +3673,168 @@ class MainWindow:
                 self.root.after(0, lambda: self._test_panel.append_line(error_text))
 
         threading.Thread(target=worker, daemon=True).start()
+
+
+# --------------------------------------------------------------------------- ModelDetailPanel
+
+
+class _LegacyModelDetailPanel(ttk.Frame):
+    """Readable, tiered editor for the selected model profile.
+
+    The overview table is intentionally not an editor anymore.  This panel is
+    the single place where model-specific settings are changed, which makes
+    restart-sensitive options and advanced features much easier to explain.
+    """
+
+    def __init__(self, parent, *, on_change, on_preset, on_action, **kwargs):
+        super().__init__(parent, **kwargs)
+        self._on_change = on_change
+        self._on_preset = on_preset
+        self._on_action = on_action
+        self._profile_name = ""
+        self._loading = False
+        self._vars = {}
+        self._build_widgets()
+
+    def _build_widgets(self):
+        self._title = ttk.Label(self, text="Select a model", font=("Microsoft YaHei UI", 12, "bold"))
+        self._title.pack(anchor=tk.W, pady=(0, 2))
+        self._summary = ttk.Label(self, text="", style="Dim.TLabel", wraplength=320)
+        self._summary.pack(anchor=tk.W, fill=tk.X, pady=(0, 8))
+
+        self._notebook = ttk.Notebook(self)
+        self._notebook.pack(fill=tk.BOTH, expand=True)
+        quick = ttk.Frame(self._notebook, padding=8)
+        generation = ttk.Frame(self._notebook, padding=8)
+        advanced = ttk.Frame(self._notebook, padding=8)
+        self._notebook.add(quick, text="Quick")
+        self._notebook.add(generation, text="Generation")
+        self._notebook.add(advanced, text="Advanced")
+
+        self._add_field(quick, 0, "Context length", "ctx", "4096", "Tokens; affects VRAM and quality")
+        self._add_field(quick, 1, "GPU layers", "gpu", "-1", "-1 = automatic, 0 = CPU only")
+        self._add_combo(quick, 2, "KV cache", "kv", ("f16", "q8_0", "q5_0", "q4_0"), "f16")
+        self._add_field(quick, 3, "CPU threads", "threads", "4", "Usually physical core count")
+        self._add_combo(quick, 4, "Flash Attention", "flash", ("auto", "on", "off"), "auto")
+        self._add_check(quick, 5, "Enable reasoning", "reasoning")
+        ttk.Button(quick, text="Recommend GPU layers", command=lambda: self._action("recommend")).grid(
+            row=6, column=0, columnspan=3, sticky=tk.EW, pady=(14, 4))
+
+        self._add_field(generation, 0, "Temperature", "temp", "0.7", "Lower = focused, higher = creative")
+        self._add_field(generation, 1, "Top-K", "topk", "40", "Candidate token limit")
+        self._add_field(generation, 2, "Top-P", "topp", "0.95", "Cumulative probability")
+        self._add_field(generation, 3, "Repeat penalty", "repeat", "1.1", "1.0 disables repetition penalty")
+        self._add_field(generation, 4, "Seed", "seed", "-1", "-1 = random")
+        self._add_field(generation, 5, "Frequency penalty", "frequency", "0.0", "Discourage repeated tokens")
+        self._add_field(generation, 6, "Presence penalty", "presence", "0.0", "Discourage reused topics")
+
+        self._add_field(advanced, 0, "Batch size", "batch", "512", "Prompt processing batch; affects VRAM")
+        self._add_field(advanced, 1, "Parallel sequences", "parallel", "1", "Concurrent requests; multiplies KV usage")
+        self._add_combo(advanced, 2, "Preset", "preset", ("default", "Preset 1", "Preset 2", "Preset 3"), "default", preset=True)
+        ttk.Label(advanced, text="Model capabilities").grid(row=3, column=0, sticky=tk.W, pady=(16, 6))
+        capability_row = ttk.Frame(advanced)
+        capability_row.grid(row=4, column=0, columnspan=3, sticky=tk.EW)
+        for col, (label, action) in enumerate((("Vision", "vision"), ("MTP", "mtp"), ("DFlash", "dflash"), ("CPU-MoE", "cpu_moe"))):
+            ttk.Button(capability_row, text=label, command=lambda a=action: self._action(a)).grid(row=0, column=col, padx=(0, 5), sticky=tk.EW)
+            capability_row.columnconfigure(col, weight=1)
+        self._advanced_note = ttk.Label(
+            advanced,
+            text="Capability buttons open the existing model-specific configuration actions.",
+            style="Dim.TLabel", wraplength=320)
+        self._advanced_note.grid(row=5, column=0, columnspan=3, sticky=tk.W, pady=(18, 0))
+
+        self._hint = ttk.Label(self, text="Changes save automatically. Most performance options need Restart.", style="Dim.TLabel", wraplength=340)
+        self._hint.pack(anchor=tk.W, pady=(8, 0))
+
+    def _add_field(self, parent, row, label, key, default, help_text):
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky=tk.W, pady=5)
+        var = tk.StringVar(value=default)
+        self._vars[key] = var
+        entry = ttk.Entry(parent, textvariable=var, width=14)
+        entry.grid(row=row, column=1, sticky=tk.EW, padx=(10, 0), pady=5)
+        ttk.Label(parent, text=help_text, style="Dim.TLabel", wraplength=160).grid(row=row, column=2, sticky=tk.W, padx=(8, 0), pady=5)
+        entry.bind("<Return>", lambda _e, k=key: self._commit(k))
+        entry.bind("<FocusOut>", lambda _e, k=key: self._commit(k))
+        parent.columnconfigure(1, weight=1)
+
+    def _add_combo(self, parent, row, label, key, values, default, preset=False):
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky=tk.W, pady=5)
+        var = tk.StringVar(value=default)
+        self._vars[key] = var
+        combo = ttk.Combobox(parent, textvariable=var, values=values, state="readonly", width=12)
+        combo.grid(row=row, column=1, sticky=tk.EW, padx=(10, 0), pady=5)
+        combo.bind("<<ComboboxSelected>>", lambda _e, k=key, p=preset: self._commit(k, preset=p))
+        parent.columnconfigure(1, weight=1)
+
+    def _add_check(self, parent, row, label, key):
+        var = tk.BooleanVar(value=False)
+        self._vars[key] = var
+        ttk.Checkbutton(parent, text=label, variable=var,
+                        command=lambda k=key: self._commit(k)).grid(
+                            row=row, column=0, columnspan=2, sticky=tk.W, pady=8)
+
+    def _commit(self, key, preset=False):
+        if self._loading or not self._profile_name:
+            return
+        if preset:
+            self._on_preset(self._profile_name, self._vars[key].get())
+            return
+        paths = {
+            "ctx": ("inference.ctx_size", int), "gpu": ("inference.gpu_layers", int),
+            "threads": ("inference.n_threads", int), "batch": ("inference.n_batch", int),
+            "parallel": ("inference.n_parallel", int), "seed": ("inference.seed", int),
+            "temp": ("sampling.temperature", float), "topk": ("sampling.top_k", int),
+            "topp": ("sampling.top_p", float), "repeat": ("sampling.repeat_penalty", float),
+            "frequency": ("sampling.frequency_penalty", float), "presence": ("sampling.presence_penalty", float),
+            "kv": ("kv_cache", str), "flash": ("server.flash_attn", str),
+            "reasoning": ("reasoning", bool),
+        }
+        path_type = paths.get(key)
+        if not path_type:
+            return
+        path, converter = path_type
+        try:
+            value = self._vars[key].get()
+            self._on_change(self._profile_name, {path: converter(value)})
+        except (TypeError, ValueError):
+            self._hint.config(text=f"Invalid value for {key}. Please check the field.", foreground=theme.AMBER)
+
+    def _action(self, action):
+        if self._profile_name:
+            self._on_action(self._profile_name, action)
+
+    def set_profile(self, profile):
+        self._loading = True
+        try:
+            self._profile_name = profile.profile_name
+            self._title.config(text=profile.display_name or profile.profile_name)
+            size = "unknown size"
+            try:
+                size = f"{os.path.getsize(os.path.join(profile.model_path, profile.gguf_file)) / 1024**3:.1f} GB"
+            except OSError:
+                pass
+            from llamacpp_loader.config.budget import estimate_vram
+            estimate = estimate_vram(profile)
+            badges = [size, profile.quant or "unknown quant",
+                      f"VRAM ≈ {estimate.total_mb / 1024:.1f} GB ({estimate.confidence})"]
+            if profile.is_moe:
+                badges.append("MoE")
+            self._summary.config(text=" · ".join(badges))
+            inf, sam = profile.inference, profile.sampling
+            values = {
+                "ctx": inf.ctx_size, "gpu": inf.gpu_layers, "kv": profile.kv_cache or "f16",
+                "threads": inf.n_threads, "flash": profile.server.flash_attn or "auto",
+                "reasoning": profile.reasoning, "temp": sam.temperature, "topk": sam.top_k,
+                "topp": sam.top_p, "repeat": sam.repeat_penalty, "seed": inf.seed,
+                "frequency": sam.frequency_penalty, "presence": sam.presence_penalty,
+                "batch": inf.n_batch, "parallel": inf.n_parallel,
+                "preset": profile.active_preset or "default",
+            }
+            for key, value in values.items():
+                self._vars[key].set(value)
+            self._hint.config(text="Changes save automatically. Most performance options need Restart.", foreground=theme.TEXT_DIM)
+        finally:
+            self._loading = False
 
 
 # --------------------------------------------------------------------------- ParameterPanel
@@ -3591,4 +4192,3 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     app = create_app(tk.Tk())
     tk.mainloop()
-

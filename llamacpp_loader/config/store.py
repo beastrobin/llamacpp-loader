@@ -20,6 +20,7 @@ from .metadata import (
     base_stem_from_mtp,
     find_mtp_draft,
     is_mtp_draft_filename,
+    looks_moe_from_name,
     read_gguf_meta,
 )
 
@@ -193,6 +194,8 @@ class ModelProfile:
     speed: float = 0.0               # measured tokens/s (filled by smoke test)
     reasoning: bool = False          # "Thinking" toggle — forced ON models can't be disabled
     reasoning_forced: bool = False   # True => Thinking cannot be turned off (greyed "on*")
+    n_layers: int = 0                 # GGUF architecture metadata, if available
+    context_length: int = 0           # native model context limit, if available
 
     # Autonomous capability detection (read from the GGUF at scan/add time).
     is_moe: bool = False             # Mixture-of-Experts (expert_count > 0)
@@ -206,6 +209,8 @@ class ModelProfile:
     dflash_model: str = ""         # DFlash external draft path (Inco AI DFlash 2)
     dflash_n_max: int = 7          # draft steps for DFlash (--spec-draft-n-max)
     dflash_enabled: bool = False   # enable DFlash speculative decoding
+    cpu_moe: bool = False          # keep ALL MoE expert weights in CPU RAM (--cpu-moe)
+    n_cpu_moe: int = 0             # keep first N layers' MoE experts in CPU (--n-cpu-moe N)
 
     server: ServerParams = field(default_factory=ServerParams)
     inference: InferenceParams = field(default_factory=InferenceParams)
@@ -319,6 +324,8 @@ class ModelProfile:
             "speed": self.speed,
             "reasoning": self.reasoning,
             "reasoning_forced": self.reasoning_forced,
+            "n_layers": self.n_layers,
+            "context_length": self.context_length,
             "is_moe": self.is_moe,
             "mtp_supported": self.mtp_supported,
             "mtp_native": self.mtp_native,
@@ -328,6 +335,8 @@ class ModelProfile:
             "dflash_model": self.dflash_model,
             "dflash_n_max": self.dflash_n_max,
             "dflash_enabled": self.dflash_enabled,
+            "cpu_moe": self.cpu_moe,
+            "n_cpu_moe": self.n_cpu_moe,
             "server": self.server.to_dict(),
             "inference": self.inference.to_dict(),
             "sampling": self.sampling.to_dict(),
@@ -368,6 +377,8 @@ class ModelProfile:
             speed=float(data.get("speed", 0.0) or 0.0),
             reasoning=bool(data.get("reasoning", False)),
             reasoning_forced=bool(data.get("reasoning_forced", False)),
+            n_layers=int(data.get("n_layers", 0) or 0),
+            context_length=int(data.get("context_length", 0) or 0),
             is_moe=bool(data.get("is_moe", False)),
             mtp_supported=bool(data.get("mtp_supported", False)),
             mtp_native=bool(data.get("mtp_native", False)),
@@ -377,6 +388,8 @@ class ModelProfile:
             dflash_model=dflash_model,
             dflash_n_max=int(data.get("dflash_n_max", 7) or 7),
             dflash_enabled=dflash_enabled,
+            cpu_moe=bool(data.get("cpu_moe", False)),
+            n_cpu_moe=int(data.get("n_cpu_moe", 0) or 0),
             server=ServerParams.from_dict(server_data),
             inference=InferenceParams.from_dict(inference_data),
             sampling=SamplingParams.from_dict(sampling_data),
@@ -405,7 +418,7 @@ class ModelProfile:
 
 @dataclass(slots=True)
 class UiState:
-    """Non-model settings saved across sessions (window size, last browse dir)."""
+    """Non-model settings saved across sessions (window and pane layout)."""
 
     window_width: int = 960
     window_height: int = 680
@@ -413,6 +426,10 @@ class UiState:
     llama_server_path: str = ""     # absolute path to llama-server executable (auto-detected)
     sort_column: str = ""           # last-used table sort column (restored on launch)
     sort_dir: str = ""              # last-used sort direction: "asc" | "desc" | ""
+    upper_sash_ratio: float = 0.50   # model list/detail split
+    content_sash_ratio: float = 0.68 # model area/console split
+    console_sash_ratio: float = 0.67 # server output/test results split
+    table_column_widths: dict[str, int] = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- config store
@@ -434,10 +451,23 @@ def _enrich_profile_from_gguf(profile: "ModelProfile", gguf_path: Path,
     if meta.get("ok"):
         if meta.get("is_moe"):
             object.__setattr__(profile, "is_moe", True)
+        if meta.get("n_layers"):
+            object.__setattr__(profile, "n_layers", int(meta["n_layers"]))
+        if meta.get("context_length"):
+            object.__setattr__(profile, "context_length", int(meta["context_length"]))
         if meta.get("mtp_supported"):
             object.__setattr__(profile, "mtp_supported", True)
         if meta.get("mtp_native"):
             object.__setattr__(profile, "mtp_native", True)
+    else:
+        # The optional `gguf` package is missing (or the file could not be
+        # parsed). Fall back to filename heuristics so a MoE model is not
+        # mis-classified as dense -- that silently disabled --cpu-moe.
+        try:
+            if looks_moe_from_name(profile.gguf_file or Path(gguf_path).name):
+                object.__setattr__(profile, "is_moe", True)
+        except Exception:  # noqa: BLE001
+            pass
 
     # Auto-detect a sibling MTP draft model.
     base_stem = Path(gguf_path).stem.replace(" ", "-").lower()
@@ -516,7 +546,15 @@ class ConfigStore:
             return
 
         try:
-            raw = json.loads(self._path.read_text(encoding="utf-8"))
+            text = self._path.read_text(encoding="utf-8")
+            # Windows tools (e.g. PowerShell Set-Content -Encoding utf8) may write
+            # a UTF-8 BOM. json.loads() chokes on a leading "\ufeff", which used to
+            # make this method bail out early so the GUI first-run branch then
+            # overwrote the user's whole file with the blank placeholder. Strip the
+            # BOM so a valid file still loads.
+            if text.startswith("\ufeff"):
+                text = text[1:]
+            raw = json.loads(text)
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("Failed to load config %s: %s", self._path, exc)
             # Recoverable - keep in-memory defaults and overwrite on next save.

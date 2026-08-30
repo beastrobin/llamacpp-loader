@@ -156,6 +156,37 @@ def _strip_quant(stem: str) -> str:
     return _QUANT_RE.sub("", stem)
 
 
+# Families that only ever ship as sparse MoE, matched as substrings.
+_MOE_NAME_HINTS = (
+    "mixtral", "-moe", "moe-", "deepseek-v3", "deepseek-r1",
+    "glm-4.5", "glm-4.6", "glm-5", "glm-4.7",
+)
+
+# "<total>B-A<active>B" convention: 35b-a3b, 235b-a22b, 122b-a10b ...
+_MOE_ACTIVE_RE = re.compile(r"(?:^|[-_])a\d+b(?![a-z0-9])", re.IGNORECASE)
+
+
+def looks_moe_from_name(name: str | Path) -> bool:
+    """Best-effort MoE detection straight from a model filename.
+
+    Fallback used when the optional ``gguf`` package is missing (or the file
+    could not be parsed), so ``read_gguf_meta`` cannot confirm ``expert_count``.
+    Without this fallback every model is silently classified as dense, which
+    disables the MoE-only features -- notably the --cpu-moe low-VRAM path.
+
+    Recognises the ``<total>B-A<active>B`` convention (Qwen3.6-35B-A3B,
+    DeepSeek-A22B, Qwen3.5-122B-A10B) plus family names that are only ever
+    sparse.
+    """
+    s = Path(name).name if isinstance(name, Path) else (name or "")
+    s = s.lower().replace(" ", "-")
+    if not s:
+        return False
+    if any(h in s for h in _MOE_NAME_HINTS):
+        return True
+    return bool(_MOE_ACTIVE_RE.search(s))
+
+
 def is_mtp_draft_filename(stem: str) -> bool:
     """True if *stem* is a speculative-decoding draft model (MTP / DFlash / EAGLE).
 

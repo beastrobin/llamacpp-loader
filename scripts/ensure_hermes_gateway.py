@@ -10,11 +10,32 @@ main agent.
 """
 
 import os
+import shutil
 import subprocess
 import sys
+from pathlib import Path
 
-HERMES_EXE = r"C:\Users\qiaoj\AI\.hermes-venv-new\Scripts\hermes.exe"
-GATEWAY_LOG_DIR = r"C:\Users\qiaoj\AppData\Local\hermes\logs"
+
+def _resolve_hermes_executable() -> str:
+    """Find Hermes without tying the helper to one developer's drive."""
+    configured = os.environ.get("HERMES_EXE", "").strip()
+    path_entry = shutil.which("hermes") or ""
+    candidates = [
+        configured,
+        path_entry,
+        str(Path(__file__).resolve().parents[2] / "hermes" / "venv" / "Scripts" / "hermes.exe"),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    # Let the OS resolve a PATH entry at subprocess time if no explicit
+    # installation can be found, so import itself remains harmless.
+    return "hermes"
+
+
+HERMES_EXE = _resolve_hermes_executable()
+GATEWAY_LOG_DIR = str(Path(os.environ.get(
+    "LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))) / "hermes" / "logs")
 
 # Clean NODE_OPTIONS: WorkBuddy injects a safe-delete hook via NODE_OPTIONS
 # which breaks child processes started from this machine's tooling.

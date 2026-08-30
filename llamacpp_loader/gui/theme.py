@@ -17,6 +17,8 @@ TEXT = "#e6e6ea"        # primary text
 TEXT_DIM = "#9a9ba6"    # secondary text
 ACCENT = "#4f8cff"      # primary accent (blue)
 ACCENT_HOVER = "#6ba1ff"
+TAB_ACTIVE = "#5d6b63"   # muted green-grey, avoids another blue accent
+TAB_HOVER = "#6c7b70"
 GREEN = "#3ddc84"
 RED = "#ff5252"
 AMBER = "#ffb74d"
@@ -78,12 +80,45 @@ def apply(root: tk.Tk) -> None:
     style.map("TButton",
               background=[("active", ACCENT_HOVER), ("pressed", ACCENT)],
               foreground=[("active", "#ffffff"), ("disabled", TEXT_DIM)])
+    style.configure("DetailAction.TButton", background=CARD_ALT,
+                    foreground=TEXT, bordercolor=BORDER, focuscolor=CARD_ALT,
+                    padding=(5, 1), relief="flat", font=FONT_SMALL)
+    style.map("DetailAction.TButton",
+              background=[("active", TAB_HOVER), ("pressed", TAB_ACTIVE)],
+              foreground=[("active", "#ffffff")])
+
+    # One scrollbar treatment for tables, consoles and the detail panel.
+    style.configure("TScrollbar", background=CARD_ALT, troughcolor=BG,
+                    bordercolor=BORDER, arrowcolor=TEXT_DIM,
+                    relief="flat", gripcount=0)
+    style.map("TScrollbar", background=[("active", TAB_HOVER), ("pressed", TAB_ACTIVE)])
     style.configure("Accent.TButton", background=ACCENT, foreground="#ffffff",
                     bordercolor=ACCENT, focuscolor=ACCENT, padding=(16, 8),
                     relief="flat", font=FONT)
     style.map("Accent.TButton",
               background=[("active", ACCENT_HOVER), ("pressed", "#3a6fd8")],
               foreground=[("disabled", "#8a8d99")])
+
+    # Compact segmented tabs used by the model detail panel.  Explicit text
+    # colours avoid the low-contrast native Notebook selected-tab state on
+    # Windows' clam theme.
+    style.configure("DetailTab.TButton", background=CARD_ALT,
+                    foreground=TEXT_DIM, bordercolor=BORDER,
+                    focuscolor=CARD_ALT, padding=(2, 2),
+                    relief="flat", font=("Microsoft YaHei UI", 8))
+    style.map("DetailTab.TButton",
+              background=[("active", FIELD), ("pressed", FIELD)],
+              foreground=[("active", TEXT)])
+    style.configure("DetailTabSelected.TButton", background=ACCENT,
+                    foreground="#ffffff", bordercolor=ACCENT,
+                    focuscolor=ACCENT, padding=(2, 2),
+                    relief="flat", font=("Microsoft YaHei UI", 8))
+    style.map("DetailTabSelected.TButton",
+              background=[("active", ACCENT_HOVER), ("pressed", ACCENT)],
+              foreground=[("active", "#ffffff"), ("pressed", "#ffffff")])
+
+    style.configure("Vram.TLabel", background=CARD_ALT, foreground=GREEN,
+                    padding=(10, 7), font=FONT_SMALL)
 
     # PanedWindow / sash
     style.configure("TPanedwindow", background=BG)

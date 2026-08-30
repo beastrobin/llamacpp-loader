@@ -61,10 +61,15 @@ class ServerConfig:
     ctx_size: int = 4096
     gpu_layers: int = -1
     n_threads: int = 4
+    n_batch: int = 512
+    n_parallel: int = 1
+    seed: int = -1
     temperature: float = 0.7
     top_k: int = 40
     top_p: float = 0.95
     repeat_penalty: float = 1.1
+    frequency_penalty: float = 0.0
+    presence_penalty: float = 0.0
     kv_cache: str = "f16"          # f16 / q8_0 / q4_0
     reasoning: bool = False        # --reasoning on/off
     mmproj: str = ""               # vision projector GGUF path (--mmproj)
@@ -76,6 +81,8 @@ class ServerConfig:
     dflash_n_max: int = 7         # draft steps for DFlash (--spec-draft-n-max)
     dflash_enabled: bool = False  # enable DFlash speculative decoding
     flash_attn: str = "auto"      # Flash Attention: "auto" | "on" | "off"
+    cpu_moe: bool = False         # keep ALL MoE expert weights in CPU RAM (--cpu-moe)
+    n_cpu_moe: int = 0            # keep first N layers' MoE experts in CPU (--n-cpu-moe N)
 
 
 # --------------------------------------------------------------------------- helpers
@@ -215,10 +222,15 @@ class ProcessManager:
                 ctx_size=inference.ctx_size,
                 gpu_layers=inference.gpu_layers,
                 n_threads=inference.n_threads,
+                n_batch=inference.n_batch,
+                n_parallel=inference.n_parallel,
+                seed=inference.seed,
                 temperature=sampling.temperature,
                 top_k=sampling.top_k,
                 top_p=sampling.top_p,
                 repeat_penalty=sampling.repeat_penalty,
+                frequency_penalty=sampling.frequency_penalty,
+                presence_penalty=sampling.presence_penalty,
                 kv_cache=config.kv_cache,
                 reasoning=config.reasoning,
                 mmproj=mmproj,
@@ -230,6 +242,8 @@ class ProcessManager:
                 dflash_n_max=getattr(config, "dflash_n_max", 7),
                 dflash_enabled=getattr(config, "dflash_enabled", False),
                 flash_attn=getattr(config.server, "flash_attn", "auto"),
+                cpu_moe=getattr(config, "cpu_moe", False),
+                n_cpu_moe=getattr(config, "n_cpu_moe", 0),
             )
         elif isinstance(config, ServerConfig):
             sc = config
@@ -512,8 +526,24 @@ class ProcessManager:
         if config.gpu_layers >= 0:
             cmd.extend(["--gpu-layers", str(config.gpu_layers)])
 
+        # MoE expert offload: keep ALL expert weights in system RAM and only
+        # load attention/embedding weights into VRAM (llama.cpp --cpu-moe).
+        # This is the llama.cpp equivalent of FreeToken's "experts in RAM,
+        # VRAM as a shelf" strategy: for a 35B-A3B MoE model (where ~26B of
+        # 35B params are experts) only ~2GB of VRAM is needed, so a Q4_K_M
+        # quant runs on 12GB cards even with background apps holding VRAM.
+        if config.cpu_moe:
+            cmd.append("--cpu-moe")
+        elif config.n_cpu_moe > 0:
+            cmd.extend(["--n-cpu-moe", str(config.n_cpu_moe)])
+
         # Threading
         cmd.extend(["-t", str(config.n_threads)])
+        cmd.extend(["-b", str(config.n_batch)])
+        if config.n_parallel > 1:
+            cmd.extend(["-np", str(config.n_parallel)])
+        if config.seed >= 0:
+            cmd.extend(["--seed", str(config.seed)])
 
         # KV cache quantization. Only the types actually accepted by
         # llama.cpp's --cache-type-k/-v are valid; weight quant names such as
@@ -611,6 +641,10 @@ class ProcessManager:
         cmd.extend(["--top-k", str(config.top_k)])
         cmd.extend(["--top-p", str(config.top_p)])
         cmd.extend(["--repeat-penalty", str(config.repeat_penalty)])
+        if config.frequency_penalty:
+            cmd.extend(["--frequency-penalty", str(config.frequency_penalty)])
+        if config.presence_penalty:
+            cmd.extend(["--presence-penalty", str(config.presence_penalty)])
 
         self._forward_log(f"Command: {' '.join(cmd)}")
         return cmd
@@ -953,4 +987,3 @@ class _PidHandle:
                 return 0
             time.sleep(0.1)
         raise subprocess.TimeoutExpired(self.pid, timeout)
-

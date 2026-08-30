@@ -45,7 +45,7 @@ python -m llamacpp_loader.main     # launch the GUI
 ## 🚀 Usage
 
 1. **Add a model**: click `Browse...` to pick a GGUF file, or point it at a directory to auto-scan
-2. **Tune params**: adjust parameters in the Inference / Sampling panel (ctx_size, gpu_layers, temperature, etc.)
+2. **Tune params**: select a model and use the right-side `Quick`, `Generation`, and `Advanced` tabs. The model table is intentionally kept compact.
 3. **Save**: parameters auto-attach to the current model profile; each model stays independent
 4. **Launch**: click `Start` → the app spawns llama-server → health check → browser opens automatically
 5. **Smoke test**: run `python scripts/smoke_live.py` to measure server status and generation speed
@@ -62,6 +62,7 @@ llamacpp-loader/
 │   │   ├── ConfigStore            # CRUD + validation + default template + scan_models auto-discovery
 │   │   └── ServerParams/...       # host/port, ctx/gpu/threads, temp/top_k/top_p
 │   ├── config/recommend.py        # Preset recommendations / baselines
+│   ├── config/budget.py           # Conservative VRAM estimates / layer suggestions
 │   ├── config/metadata.py         # GGUF metadata reader (MoE / MTP detection)
 │   ├── process_manager/manager.py # Subprocess lifecycle management
 │   │   ├── ProcessManager         # Popen wrapper + state machine (idle→starting→running→stopping)

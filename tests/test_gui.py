@@ -130,9 +130,125 @@ class TestControlBar:
         assert str(mw._toolbar_restart_btn.cget("state")) == "disabled"  # type: ignore[attr-defined]
 
         mw._set_toolbar_running(True)
-        assert str(mw._toolbar_start_btn.cget("state")) == "disabled"  # type: ignore[attr-defined]
+        # While running, Start becomes a safe shortcut to the existing Web UI.
+        assert str(mw._toolbar_start_btn.cget("state")) == "normal"  # type: ignore[attr-defined]
+        assert mw._toolbar_start_btn.cget("text") == "Open Web"  # type: ignore[attr-defined]
         assert str(mw._toolbar_stop_btn.cget("state")) == "normal"  # type: ignore[attr-defined]
         assert str(mw._toolbar_restart_btn.cget("state")) == "normal"  # type: ignore[attr-defined]
+
+
+class TestMainLayout:
+    """Regression coverage for the model table/detail split pane."""
+
+    def test_model_panes_are_mapped_and_added_model_is_visible(
+            self, tk_root_fixture, tmp_path):
+        from unittest.mock import MagicMock, patch
+        from llamacpp_loader.config.store import ConfigStore, ModelProfile
+        from llamacpp_loader.gui.app import MainWindow
+
+        model_file = tmp_path / "visible-model.gguf"
+        model_file.write_bytes(b"GGUF")
+        isolated = ConfigStore(path=tmp_path / "settings.json")
+        isolated.add(ModelProfile(
+            profile_name="visible-model",
+            display_name="Visible Model",
+            model_path=str(tmp_path),
+            gguf_file=model_file.name,
+        ))
+
+        with patch("llamacpp_loader.config.store.ConfigStore", return_value=isolated):
+            mw = MainWindow(tk_root_fixture)
+
+        tk_root_fixture.update_idletasks()
+        panes = {str(pane) for pane in mw._upper_pane.panes()}
+
+        assert mw._table_frame.winfo_parent() == str(mw._upper_pane)
+        assert mw._detail_frame.winfo_parent() == str(mw._upper_pane)
+        assert str(mw._table_frame) in panes
+        assert str(mw._detail_frame) in panes
+        assert mw._detail_panel.winfo_manager() == "pack"
+        assert mw._detail_panel.pack_info()["fill"] == "both"
+        assert mw._detail_panel._title.cget("text") == "Visible Model"
+        # The upper splitter intentionally uses the same themed ttk pane as
+        # Server/Test so its sash has the same visual and hit target.
+        assert mw._upper_pane.winfo_class() == "TPanedwindow"
+        assert mw._workspace_separator.winfo_manager() == "pack"
+        assert mw._tree.exists("visible-model")
+        # The custom canvas header is the only header; an empty ``show`` value
+        # prevents ttk from reserving a second blank native heading row.
+        assert mw._tree.cget("show") == ""
+
+        mw._running_profile_name = "visible-model"
+        mw.proc_mgr.stop = MagicMock()
+        mw._on_stop()
+        assert mw._tree.set("visible-model", "status") == "Ready"
+
+        # The custom header must be real canvas content and remain aligned
+        # with the Treeview when the shared horizontal scrollbar moves.
+        assert mw._header_labels["model"].winfo_parent() == str(mw._header_inner)
+        mw._tree.column("model", width=1200)
+        mw._relayout_header()
+        mw._scroll_table_x("moveto", "1.0")
+        tk_root_fixture.update_idletasks()
+        assert mw._tree.xview()[0] > 0
+        assert abs(mw._tree.xview()[0] - mw._header_canvas.xview()[0]) < 0.02
+
+
+class TestModelDetailPanel:
+    """Compact parameter editor conversions and live budget display."""
+
+    def test_context_k_and_kv_display_map_to_runtime_values(
+            self, tk_root_fixture, tmp_path):
+        from llamacpp_loader.config.store import InferenceParams, ModelProfile
+        from llamacpp_loader.gui.detail_panel import ModelDetailPanel
+
+        model = tmp_path / "demo-q4.gguf"
+        model.write_bytes(b"GGUF")
+        changes = []
+        panel = ModelDetailPanel(
+            tk_root_fixture,
+            on_change=lambda name, update: changes.append((name, update)),
+            on_preset=lambda *_: None,
+            on_action=lambda *_: None)
+        panel.set_profile(ModelProfile(
+            profile_name="demo", display_name="Demo",
+            model_path=str(tmp_path), gguf_file=model.name,
+            kv_cache="q8_0", inference=InferenceParams(ctx_size=32768)))
+
+        assert panel._vars["ctx"].get() == "32"
+        assert panel._vars["kv"].get() == "Q8"
+        assert int(panel._inputs["gpu"].cget("width")) == 9
+        assert int(panel._inputs["gpu"].grid_info()["pady"]) == 2
+        assert panel._vscroll.winfo_manager() == "grid"
+        assert panel._hscroll.winfo_manager() == "grid"
+        assert panel._canvas.cget("xscrollcommand")
+        assert panel._canvas.cget("yscrollcommand")
+        assert panel._canvas.bind("<MouseWheel>")
+        assert "Estimated VRAM" in panel._vram.cget("text")
+        assert "weights" in panel._vram.cget("text")
+        assert "KV" in panel._vram.cget("text")
+        # Quick is deliberately balanced: four setting rows per column.
+        assert {child.grid_info()["row"] for child in panel._quick_columns[0].grid_slaves()} == {0, 1, 2, 3}
+        assert {child.grid_info()["row"] for child in panel._quick_columns[1].grid_slaves()} == {0, 1, 2, 3}
+        # Advanced is a four-row form, not four explanatory Configure buttons.
+        assert set(panel._capability_status) == {"vision_status", "mtp_status", "dflash_status"}
+        assert panel._vars["cpu_moe_mode"].get() == "GPU all"
+
+        panel._vars["ctx"].set("64")
+        panel._commit("ctx")
+        panel._vars["kv"].set("Q4")
+        panel._commit("kv")
+
+        assert ("demo", {"inference.ctx_size": 65536}) in changes
+        assert ("demo", {"kv_cache": "q4_0"}) in changes
+
+        panel._vars["mtp_enabled"].set("On")
+        panel._commit_capability("mtp")
+        panel._vars["cpu_moe_mode"].set("First N")
+        panel._vars["cpu_moe_layers"].set("12")
+        panel._commit_cpu_moe()
+        assert ("demo", {"mtp_enabled": True}) in changes
+        assert ("demo", {"cpu_moe": False, "n_cpu_moe": 12}) in changes
 
 
 class TestOnClosing:

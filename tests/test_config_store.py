@@ -8,6 +8,7 @@ import pytest
 from llamacpp_loader.config.store import (
     ConfigStore, ModelProfile, ServerParams, InferenceParams, SamplingParams, UiState,
 )
+from llamacpp_loader.config.metadata import looks_moe_from_name
 
 
 # ===================================================================== defaults fixture
@@ -349,4 +350,58 @@ class TestModelScan:
         profiles = ConfigStore.scan_models(str(test_dir))
         # Both should be found with distinct profile names due to path context
         assert len(profiles) == 2
+
+
+# ===================================================================== cpu_moe
+
+
+class TestCpuMoePersistence:
+
+    def test_cpu_moe_roundtrip(self):
+        p = ModelProfile(profile_name="moe-model", cpu_moe=True)
+        data = p.to_dict()
+        assert data["cpu_moe"] is True
+        p2 = ModelProfile.from_dict(data)
+        assert p2.cpu_moe is True
+
+    def test_cpu_moe_defaults_false(self):
+        p = ModelProfile(profile_name="dense-model")
+        assert p.cpu_moe is False
+        assert p.to_dict()["cpu_moe"] is False
+
+    def test_n_cpu_moe_roundtrip(self):
+        p = ModelProfile(profile_name="moe-model", n_cpu_moe=18)
+        data = p.to_dict()
+        assert data["n_cpu_moe"] == 18
+        p2 = ModelProfile.from_dict(data)
+        assert p2.n_cpu_moe == 18
+
+    def test_n_cpu_moe_defaults_zero(self):
+        p = ModelProfile(profile_name="dense-model")
+        assert p.n_cpu_moe == 0
+        assert p.to_dict()["n_cpu_moe"] == 0
+
+
+# ============================================================ MoE name fallback
+
+
+class TestMoENameFallback:
+    """MoE must still be detected when the optional `gguf` package is absent."""
+
+    def test_detects_a3b_naming(self):
+        assert looks_moe_from_name("Qwen3.6-35B-A3B-Aggressive-Q4_K_M.gguf") is True
+
+    def test_detects_other_active_param_sizes(self):
+        assert looks_moe_from_name("DeepSeek-V3-0324-A22B-Q4_K_M.gguf") is True
+        assert looks_moe_from_name("Qwen3.5-122B-A10B-Q4_K_M.gguf") is True
+
+    def test_detects_mixtral_family(self):
+        assert looks_moe_from_name("Mixtral-8x7B-v0.1-Q4_K_M.gguf") is True
+
+    def test_dense_models_stay_false(self):
+        assert looks_moe_from_name("Qwen3.8-27B-Q4_K_M.gguf") is False
+        assert looks_moe_from_name("gemma-4-12B-it-QAT-Q4_0.gguf") is False
+
+    def test_empty_name_is_false(self):
+        assert looks_moe_from_name("") is False
 
