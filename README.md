@@ -8,11 +8,11 @@ It folds the whole "pick a model → tune params → launch → test" workflow y
 
 ---
 
-## 🖼️ GUI Preview
+## 🖼️ GUI Preview (V1.10)
 
 ![llamacpp-loader GUI preview](docs/gui_preview.png)
 
-> This preview uses fictional model names and paths only. It is intentionally safe to publish and does not contain a user's local configuration.
+> Current V1.10 preview using fictional model names and paths only. It is intentionally safe to publish and does not contain a user's local configuration.
 
 ---
 
