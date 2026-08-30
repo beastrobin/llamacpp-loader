@@ -4,7 +4,7 @@
 
 It folds the whole "pick a model → tune params → launch → test" workflow you used to do with hand-written `.bat` files and sticky notes into a single GUI:
 
-![Python](https://img.shields.io/badge/Python-3.10%2B-blue) ![License](https://img.shields.io/badge/License-MIT-green) ![Tests](https://img.shields.io/badge/tests-70%20passed-brightgreen)
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue) ![License](https://img.shields.io/badge/License-MIT-green) ![Tests](https://img.shields.io/badge/tests-90%20passed-brightgreen)
 
 ---
 
@@ -12,7 +12,7 @@ It folds the whole "pick a model → tune params → launch → test" workflow y
 
 ![llamacpp-loader GUI preview](docs/gui_preview.png)
 
-> Screenshot uses fictional demo models only — no real user model names or local paths are exposed.
+> This preview uses fictional model names and paths only. It is intentionally safe to publish and does not contain a user's local configuration.
 
 ---
 
@@ -22,8 +22,8 @@ It folds the whole "pick a model → tune params → launch → test" workflow y
 |---|---|
 | 🎯 **Model management** | Add GGUF models via a file picker; each gets its own auto-generated `ModelProfile` (independent parameters per model) |
 | 🔎 **Auto-discovery** | `scan_models()` recursively scans a directory, detects every `.gguf` and builds a readable config |
-| ⚙️ **Parameter tuning** | Launch params (ctx / GPU layers / threads) + sampling params (temperature / top_k / top_p) with a visual editor |
-| 💾 **Parameter persistence** | Each model saves its own JSON config; switching models never overwrites another |
+| ⚙️ **Parameter tuning** | Compact Quick (4+4), Generation, and Advanced tabs for launch, sampling, and optional capability settings |
+| 💾 **Parameter persistence** | Model parameters, table widths, splitter positions, and window size are saved between launches |
 | 🚀 **One-click launch** | Select model → Start → auto-spawns llama-server → health check passes → **opens the Web UI automatically** |
 | 🧪 **Smoke test** | `SmokeTestRunner` checks server health + `scripts/smoke_live.py` measures real throughput (tokens/s) |
 | 🛑 **Graceful shutdown** | Stops the process, releases VRAM/RAM, and supports crash auto-restart (watchdog) |
@@ -35,21 +35,23 @@ It folds the whole "pick a model → tune params → launch → test" workflow y
 git clone https://github.com/beastrobin/llamacpp-loader
 cd llamacpp-loader
 
-# Core runtime needs NO third-party deps (pure stdlib: tkinter / subprocess / json / threading).
-# Optional: `pip install gguf` enables automatic MoE / MTP metadata detection when scanning models.
-python -m llamacpp_loader.main     # launch the GUI
+# Core runtime needs no third-party packages (Tkinter is included with the official Python build).
+# Optional: install gguf for automatic MoE / MTP metadata detection.
+python -m pip install -e .[dev]
+python -m llamacpp_loader.main
 ```
 
 > ⚠️ Note: `llama-server.exe` (the llama.cpp binary itself) is **not** included in this repo. Download it from the [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases) page.
 
 ## 🚀 Usage
 
-1. **Add a model**: click `Browse...` to pick a GGUF file, or point it at a directory to auto-scan
-2. **Tune params**: select a model and use the right-side `Quick`, `Generation`, and `Advanced` tabs. The model table is intentionally kept compact.
-3. **Save**: parameters auto-attach to the current model profile; each model stays independent
-4. **Launch**: click `Start` → the app spawns llama-server → health check → browser opens automatically
-5. **Smoke test**: run `python scripts/smoke_live.py` to measure server status and generation speed
-6. **Stop**: click `Stop` to shut down gracefully, or let the watchdog auto-restart on crash
+1. **Choose the llama.cpp folder**: click `llamacpp path` and select the directory containing `llama-server.exe`.
+2. **Add a model**: click `Add model` and choose a GGUF file; each model receives an independent profile.
+3. **Tune parameters**: use `Quick`, `Generation`, and `Advanced`. Quick uses context values in K, KV cache choices F16/Q8/Q4, GPU Auto/Recommend, and balanced 4+4 columns.
+4. **Configure optional capabilities**: Advanced provides aligned Vision, MTP, DFlash, and CPU-MoE rows with On/Off, file selection, clear, and status controls.
+5. **Launch**: click `Start Server`; the app starts llama-server on the configured port and can open the local Web UI.
+6. **Smoke test**: click `Smoke Test` after launch, or run `python scripts/smoke_live.py` against a running local server.
+7. **Stop**: click `Stop Server` to shut down gracefully; model and layout settings are saved automatically.
 
 ## 🏗️ Architecture
 
@@ -71,7 +73,8 @@ llamacpp-loader/
 │   ├── smoke_test/runner.py       # Post-launch health validation
 │   │   ├── SmokeTestRunner        # /health first, falls back to /v1/models on 404
 │   │   └── ServerHealthChecker    # Synchronous single-request check (for pytest)
-│   ├── gui/app.py                 # Tkinter GUI (MainWindow/ParameterPanel/ConsolePanel/StatusBar/ControlBar)
+│   ├── gui/app.py                 # Main window, model table, server/test panels, and actions
+│   ├── gui/detail_panel.py        # Scrollable Quick/Generation/Advanced parameter editor
 │   └── gui/theme.py               # Dark theme styling (colors, fonts, ttk styles)
 ├── scripts/
 │   ├── smoke_live.py              # Live smoke test: health check + throughput (tokens/s)
@@ -92,7 +95,7 @@ llamacpp-loader/
 
 ```bash
 pip install pytest
-pytest tests/ -v          # 70 tests, stable across consecutive runs
+pytest tests/ -v          # 90 tests
 python scripts/smoke_live.py   # live smoke test (requires llama-server running on 8080)
 ```
 

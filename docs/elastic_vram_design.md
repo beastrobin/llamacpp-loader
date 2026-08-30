@@ -1,7 +1,7 @@
 # llamacpp-loader × FreeToken 弹性显存设计草案
 
 > Status: draft / proposal
-> Author: research note for Robin (beastrobin)
+> Author: llamacpp-loader contributors
 > Date: 2026-08-28
 
 ## 0. 背景与结论速览
