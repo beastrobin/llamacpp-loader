@@ -227,13 +227,18 @@ class TestModelDetailPanel:
         assert "Estimated VRAM" in panel._vram.cget("text")
         assert "weights" in panel._vram.cget("text")
         assert "KV" in panel._vram.cget("text")
-        # Quick is deliberately balanced: four setting rows per column.
-        assert {child.grid_info()["row"] for child in panel._quick_columns[0].grid_slaves()} == {0, 1, 2, 3}
+        assert panel._pages["Quick"].grid_columnconfigure(0)["weight"] == 0
+        assert panel._pages["Generation"].grid_columnconfigure(0)["weight"] == 0
+        # CPU-MoE sits immediately below GPU layers and shares its columns.
+        assert {child.grid_info()["row"] for child in panel._quick_columns[0].grid_slaves()} == {0, 1, 2, 3, 4}
         assert {child.grid_info()["row"] for child in panel._quick_columns[1].grid_slaves()} == {0, 1, 2, 3}
-        # Advanced is a five-row form, not four explanatory Configure buttons.
+        # Advanced is a four-row form, not four explanatory Configure buttons.
         assert set(panel._capability_status) == {
             "vision_status", "mtp_status", "dflash_status", "ngram_status"}
         assert panel._vars["cpu_moe_mode"].get() == "GPU all"
+        assert panel._inputs["cpu_moe_layers"].master is panel._quick_columns[0]
+        assert panel._inputs["cpu_moe_mode"].grid_info()["column"] == panel._inputs["gpu"].grid_info()["column"]
+        assert panel._inputs["cpu_moe_layers"].grid_info()["column"] == 3
 
         panel._vars["ctx"].set("64")
         panel._commit("ctx")

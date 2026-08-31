@@ -80,21 +80,25 @@ class ModelDetailPanel(ttk.Frame):
         inner.grid_rowconfigure(2, weight=1)
         inner.grid_columnconfigure(0, weight=1)
         self._select_tab("Quick")
-        quick.columnconfigure(0, weight=1); quick.columnconfigure(1, weight=1)
-        q_left = ttk.Frame(quick, style="Detail.TFrame"); q_left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        q_right = ttk.Frame(quick, style="Detail.TFrame"); q_right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        # Keep the two setting groups compact and left-aligned.  Giving both
+        # columns a weight spreads them across the whole canvas, creating a
+        # large, unhelpful gap on wide windows.
+        q_left = ttk.Frame(quick, style="Detail.TFrame"); q_left.grid(row=0, column=0, sticky="nw")
+        q_right = ttk.Frame(quick, style="Detail.TFrame"); q_right.grid(row=0, column=1, sticky="nw", padx=(48, 0))
         self._quick_columns = (q_left, q_right)
         self._add_combo(q_left, 0, "Context (K)", "ctx", ("32", "64", "128", "256", "512"), "32")
         self._add_gpu_row(q_left, 1)
-        self._add_combo(q_left, 2, "KV cache", "kv", ("F16", "Q8", "Q4"), "F16")
-        self._add_field(q_left, 3, "Batch size", "batch", "512", "")
+        self._add_cpu_moe_row(q_left, 2)
+        self._add_combo(q_left, 3, "KV cache", "kv", ("F16", "Q8", "Q4"), "F16")
+        self._add_field(q_left, 4, "Batch size", "batch", "512", "")
         self._add_field(q_right, 0, "CPU threads", "threads", "4", "")
         self._add_combo(q_right, 1, "Flash Attention", "flash", ("auto", "on", "off"), "auto")
-        self._add_combo(q_right, 2, "Reasoning", "reasoning", ("auto", "on", "off"), "auto")
+        # Reasoning is persisted as a boolean and llama-server treats the
+        # option as enabled-or-omitted, so there is no distinct auto state.
+        self._add_combo(q_right, 2, "Reasoning", "reasoning", ("on", "off"), "off")
         self._add_field(q_right, 3, "Parallel", "parallel", "1", "")
-        generation.columnconfigure(0, weight=1); generation.columnconfigure(1, weight=1)
-        g_left = ttk.Frame(generation, style="Detail.TFrame"); g_left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        g_right = ttk.Frame(generation, style="Detail.TFrame"); g_right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        g_left = ttk.Frame(generation, style="Detail.TFrame"); g_left.grid(row=0, column=0, sticky="nw")
+        g_right = ttk.Frame(generation, style="Detail.TFrame"); g_right.grid(row=0, column=1, sticky="nw", padx=(48, 0))
         gen_fields = (("Temperature", "temp", "0.7"), ("Top-K", "topk", "40"), ("Top-P", "topp", "0.95"), ("Repeat penalty", "repeat", "1.1"), ("Seed", "seed", "-1"), ("Frequency penalty", "frequency", "0.0"), ("Presence penalty", "presence", "0.0"))
         for row, item in enumerate(gen_fields[:4]): self._add_field(g_left, row, *item, "")
         for row, item in enumerate(gen_fields[4:]): self._add_field(g_right, row, *item, "")
@@ -102,8 +106,7 @@ class ModelDetailPanel(ttk.Frame):
         self._add_vision_row(advanced, 0)
         self._add_draft_row(advanced, 1, "MTP", "mtp")
         self._add_draft_row(advanced, 2, "DFlash", "dflash")
-        self._add_cpu_moe_row(advanced, 3)
-        self._add_ngram_row(advanced, 4)
+        self._add_ngram_row(advanced, 3)
         self._hint = None
         self._bind_mousewheel(self)
         self.after_idle(self._sync_scrollregion)
@@ -203,9 +206,9 @@ class ModelDetailPanel(ttk.Frame):
         combo.grid(row=0, column=1, sticky=tk.W, padx=(8, 4), pady=2)
         combo.bind("<<ComboboxSelected>>", lambda _e: self._commit_vision())
         ttk.Button(line, text="Browse", width=9, style="DetailAction.TButton",
-                   command=lambda: self._action("vision_pick")).grid(row=0, column=2, padx=2, pady=2)
+                   command=lambda: self._action("vision_pick")).grid(row=0, column=2, padx=2, pady=2, ipady=3)
         ttk.Button(line, text="Clear", width=9, style="DetailAction.TButton",
-                   command=lambda: self._action("vision_clear")).grid(row=0, column=3, padx=(2, 0), pady=2)
+                   command=lambda: self._action("vision_clear")).grid(row=0, column=3, padx=(2, 0), pady=2, ipady=3)
         self._add_status_entry(line, 0, "vision_status", column=4)
 
     def _add_draft_row(self, parent, row, label, prefix):
@@ -218,24 +221,26 @@ class ModelDetailPanel(ttk.Frame):
         combo.grid(row=0, column=1, sticky=tk.W, padx=(8, 4), pady=2)
         combo.bind("<<ComboboxSelected>>", lambda _e, p=prefix: self._commit_capability(p))
         ttk.Button(line, text="Browse", width=9, style="DetailAction.TButton",
-                   command=lambda p=prefix: self._action(f"{p}_pick")).grid(row=0, column=2, padx=2, pady=2)
+                   command=lambda p=prefix: self._action(f"{p}_pick")).grid(row=0, column=2, padx=2, pady=2, ipady=3)
         ttk.Button(line, text="Clear", width=9, style="DetailAction.TButton",
-                   command=lambda p=prefix: self._action(f"{p}_clear")).grid(row=0, column=3, padx=(2, 0), pady=2)
+                   command=lambda p=prefix: self._action(f"{p}_clear")).grid(row=0, column=3, padx=(2, 0), pady=2, ipady=3)
         self._add_status_entry(line, 0, f"{prefix}_status", column=4)
 
     def _add_cpu_moe_row(self, parent, row):
-        line = self._advanced_row(parent, row, 4)
-        ttk.Label(line, text="CPU-MoE", width=10).grid(row=0, column=0, sticky=tk.W, pady=2)
+        # This lives beside GPU layers in Quick, so use its parent grid
+        # directly: mode/input line up with GPU / Auto / Recommend.
+        ttk.Label(parent, text="CPU-MoE").grid(row=row, column=0, sticky=tk.W, pady=2)
         mode = tk.StringVar(value="GPU all")
         self._vars["cpu_moe_mode"] = mode
-        combo = ttk.Combobox(line, textvariable=mode, values=("GPU all", "CPU all", "First N"), state="readonly", width=7)
-        combo.grid(row=0, column=1, sticky=tk.W, padx=(8, 4), pady=2)
+        combo = ttk.Combobox(parent, textvariable=mode, values=("GPU all", "CPU all", "First N"), state="readonly", width=9)
+        combo.grid(row=row, column=1, sticky=tk.W, padx=(8, 2), pady=2)
+        self._inputs["cpu_moe_mode"] = combo
         combo.bind("<<ComboboxSelected>>", lambda _e: self._commit_cpu_moe())
-        ttk.Label(line, text="Layers").grid(row=0, column=2, sticky=tk.W, padx=(8, 2), pady=2)
+        ttk.Label(parent, text="Layers").grid(row=row, column=2, sticky=tk.W, padx=(8, 2), pady=2)
         layers = tk.StringVar(value="0")
         self._vars["cpu_moe_layers"] = layers
-        entry = ttk.Entry(line, textvariable=layers, width=9)
-        entry.grid(row=0, column=3, sticky=tk.W, pady=2)
+        entry = ttk.Entry(parent, textvariable=layers, width=9)
+        entry.grid(row=row, column=3, sticky=tk.W, padx=(2, 0), pady=2)
         self._inputs["cpu_moe_layers"] = entry
         entry.bind("<Return>", lambda _e: self._commit_cpu_moe())
         entry.bind("<FocusOut>", lambda _e: self._commit_cpu_moe())
