@@ -9,7 +9,8 @@ GGUF file -- no external agent, no network, no manual lookup:
                       Prediction layers (``<arch>.attention.layer_types``
                       contains "mtp"), i.e. it can be sped up with an MTP
                       draft model.
-* ``n_layers`` / ``context_length`` -- used for context-window budgeting.
+* ``n_layers`` / ``context_length`` / ``n_kv_heads`` / ``head_dim`` -- used
+  for context-window budgeting.
 
 It is deliberately dependency-light: ``gguf`` (and its ``numpy`` dependency)
 are imported lazily so the GUI never crashes on a machine that does not have
@@ -60,8 +61,9 @@ def _field(reader: Any, name: str, default: Any = None) -> Any:
 def read_gguf_meta(path: str | Path) -> dict:
     """Return capability metadata read directly from a GGUF file.
 
-    Returns a dict with keys: arch, n_layers, context_length, expert_count,
-    is_moe, mtp_supported, ok.  ``ok`` is False when the file could not be
+    Returns a dict with keys: arch, n_layers, context_length, n_kv_heads,
+    head_dim, expert_count, is_moe, mtp_supported, ok.  ``ok`` is False when
+    the file could not be
     read (e.g. ``gguf`` not installed or not a GGUF) -- callers should treat
     missing capabilities gracefully.
     """
@@ -69,6 +71,8 @@ def read_gguf_meta(path: str | Path) -> dict:
         "arch": "",
         "n_layers": 0,
         "context_length": 0,
+        "n_kv_heads": 0,
+        "head_dim": 0,
         "expert_count": 0,
         "is_moe": False,
         "mtp_supported": False,
@@ -93,10 +97,16 @@ def read_gguf_meta(path: str | Path) -> dict:
 
         n_layers = _field(reader, f"{arch}.block_count") or 0
         ctx = _field(reader, f"{arch}.context_length") or 0
+        n_kv_heads = (_field(reader, f"{arch}.attention.head_count_kv")
+                      or _field(reader, f"{arch}.attention.head_count") or 0)
+        head_dim = (_field(reader, f"{arch}.attention.key_length")
+                    or _field(reader, f"{arch}.attention.value_length") or 0)
         experts = _field(reader, f"{arch}.expert_count") or 0
 
         result["n_layers"] = int(n_layers) if n_layers else 0
         result["context_length"] = int(ctx) if ctx else 0
+        result["n_kv_heads"] = int(n_kv_heads) if n_kv_heads else 0
+        result["head_dim"] = int(head_dim) if head_dim else 0
         result["expert_count"] = int(experts) if experts else 0
         result["is_moe"] = result["expert_count"] > 0
 

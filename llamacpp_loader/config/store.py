@@ -249,6 +249,8 @@ class ModelProfile:
     reasoning_forced: bool = False   # True => Thinking cannot be turned off (greyed "on*")
     n_layers: int = 0                 # GGUF architecture metadata, if available
     context_length: int = 0           # native model context limit, if available
+    n_kv_heads: int = 0               # GGUF KV-cache head count, if available
+    head_dim: int = 0                 # GGUF KV-cache key/value head width
 
     # Autonomous capability detection (read from the GGUF at scan/add time).
     is_moe: bool = False             # Mixture-of-Experts (expert_count > 0)
@@ -384,6 +386,8 @@ class ModelProfile:
             "reasoning_forced": self.reasoning_forced,
             "n_layers": self.n_layers,
             "context_length": self.context_length,
+            "n_kv_heads": self.n_kv_heads,
+            "head_dim": self.head_dim,
             "is_moe": self.is_moe,
             "mtp_supported": self.mtp_supported,
             "mtp_native": self.mtp_native,
@@ -439,6 +443,8 @@ class ModelProfile:
             reasoning_forced=bool(data.get("reasoning_forced", False)),
             n_layers=int(data.get("n_layers", 0) or 0),
             context_length=int(data.get("context_length", 0) or 0),
+            n_kv_heads=int(data.get("n_kv_heads", 0) or 0),
+            head_dim=int(data.get("head_dim", 0) or 0),
             is_moe=bool(data.get("is_moe", False)),
             mtp_supported=bool(data.get("mtp_supported", False)),
             mtp_native=bool(data.get("mtp_native", False)),
@@ -502,10 +508,10 @@ class UiState:
 
 def _enrich_profile_from_gguf(profile: "ModelProfile", gguf_path: Path,
                               drafts: Optional[dict[str, Path]] = None) -> None:
-    """Best-effort: read GGUF metadata to populate MoE / MTP capability fields.
+    """Best-effort: read GGUF metadata to populate capability and KV fields.
 
-    - Sets ``is_moe`` and ``mtp_supported`` from the GGUF (requires the optional
-      ``gguf`` package; silently skipped otherwise).
+    - Sets ``is_moe``, MTP fields, and KV-cache dimensions from the GGUF
+      (requires the optional ``gguf`` package; silently skipped otherwise).
     - Auto-pairs a sibling ``<base>-mtp.gguf`` draft model if present, enabling
       MTP speculative decoding out of the box.
     """
@@ -520,6 +526,10 @@ def _enrich_profile_from_gguf(profile: "ModelProfile", gguf_path: Path,
             object.__setattr__(profile, "n_layers", int(meta["n_layers"]))
         if meta.get("context_length"):
             object.__setattr__(profile, "context_length", int(meta["context_length"]))
+        if meta.get("n_kv_heads"):
+            object.__setattr__(profile, "n_kv_heads", int(meta["n_kv_heads"]))
+        if meta.get("head_dim"):
+            object.__setattr__(profile, "head_dim", int(meta["head_dim"]))
         if meta.get("mtp_supported"):
             object.__setattr__(profile, "mtp_supported", True)
         if meta.get("mtp_native"):

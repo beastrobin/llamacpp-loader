@@ -2582,7 +2582,9 @@ class MainWindow:
 
     def _ensure_profile_metadata(self, profile):
         """Best-effort refresh of GGUF layer/context metadata on demand."""
-        if getattr(profile, "n_layers", 0):
+        if (getattr(profile, "n_layers", 0)
+                and getattr(profile, "n_kv_heads", 0)
+                and getattr(profile, "head_dim", 0)):
             return profile
         try:
             from llamacpp_loader.config.metadata import read_gguf_meta
@@ -2591,7 +2593,7 @@ class MainWindow:
             if not meta.get("ok"):
                 return profile
             updates = {}
-            for key in ("n_layers", "context_length", "is_moe",
+            for key in ("n_layers", "context_length", "n_kv_heads", "head_dim", "is_moe",
                         "mtp_supported", "mtp_native"):
                 value = meta.get(key)
                 if value:
