@@ -6,6 +6,12 @@ import tkinter as tk
 from tkinter import ttk
 
 from llamacpp_loader.config.budget import estimate_vram
+from llamacpp_loader.config.store import (
+    DEFAULT_NGRAM_TYPE,
+    NGRAM_LABELS,
+    normalize_ngram_type,
+    ngram_label,
+)
 from llamacpp_loader.gui import theme
 
 
@@ -97,6 +103,7 @@ class ModelDetailPanel(ttk.Frame):
         self._add_draft_row(advanced, 1, "MTP", "mtp")
         self._add_draft_row(advanced, 2, "DFlash", "dflash")
         self._add_cpu_moe_row(advanced, 3)
+        self._add_ngram_row(advanced, 4)
         self._hint = None
         self._bind_mousewheel(self)
         self.after_idle(self._sync_scrollregion)
@@ -233,6 +240,31 @@ class ModelDetailPanel(ttk.Frame):
         entry.bind("<Return>", lambda _e: self._commit_cpu_moe())
         entry.bind("<FocusOut>", lambda _e: self._commit_cpu_moe())
 
+    def _add_ngram_row(self, parent, row):
+        """N-gram speculative decoding — no draft file, stacks with MTP/DFlash."""
+        line = self._advanced_row(parent, row, 4)
+        ttk.Label(line, text="N-gram", width=10).grid(row=0, column=0, sticky=tk.W, pady=2)
+        mode = tk.StringVar(value="Off")
+        self._vars["ngram_mode"] = mode
+        combo = ttk.Combobox(line, textvariable=mode, values=tuple(NGRAM_LABELS),
+                             state="readonly", width=7)
+        combo.grid(row=0, column=1, sticky=tk.W, padx=(8, 4), pady=2)
+        self._inputs["ngram_mode"] = combo
+        combo.bind("<<ComboboxSelected>>", lambda _e: self._commit_ngram())
+        # Align with the status entry on the Vision / MTP / DFlash rows.
+        self._add_status_entry(line, 0, "ngram_status", column=4)
+        self._vars["ngram_status"].set("free speed-up, stacks with MTP")
+
+    def _commit_ngram(self):
+        """Persist the n-gram choice; "Off" disables the track entirely."""
+        if self._loading or not self._profile_name:
+            return
+        spec = NGRAM_LABELS.get(self._vars["ngram_mode"].get(), "")
+        self._on_change(self._profile_name, {
+            "ngram_enabled": bool(spec),
+            "ngram_type": spec or DEFAULT_NGRAM_TYPE,
+        })
+
     def _commit_capability(self, prefix):
         if self._loading or not self._profile_name:
             return
@@ -319,4 +351,9 @@ class ModelDetailPanel(ttk.Frame):
                 cpu_moe_mode, cpu_moe_layers = "GPU all", 0
             self._vars["cpu_moe_mode"].set(cpu_moe_mode)
             self._vars["cpu_moe_layers"].set(cpu_moe_layers)
+            ngram_spec = normalize_ngram_type(getattr(profile, "ngram_type", "")) \
+                if getattr(profile, "ngram_enabled", False) else ""
+            self._vars["ngram_mode"].set(ngram_label(ngram_spec))
+            self._vars["ngram_status"].set(
+                ngram_spec if ngram_spec else "free speed-up, stacks with MTP")
         finally: self._loading = False

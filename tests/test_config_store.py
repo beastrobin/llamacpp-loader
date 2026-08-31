@@ -405,3 +405,54 @@ class TestMoENameFallback:
     def test_empty_name_is_false(self):
         assert looks_moe_from_name("") is False
 
+
+
+# ============================================================ N-gram spec decoding
+
+
+class TestNgramConfig:
+    """N-gram selection must round-trip and degrade safely."""
+
+    def test_disabled_by_default(self):
+        p = ModelProfile(profile_name="m", gguf_file="m.gguf")
+        assert p.ngram_enabled is False
+        assert p.ngram_type == "ngram-simple"
+
+    def test_round_trips_through_dict(self):
+        p = ModelProfile(profile_name="m", gguf_file="m.gguf",
+                         ngram_enabled=True, ngram_type="ngram-mod")
+        back = ModelProfile.from_dict(p.to_dict())
+        assert back.ngram_enabled is True
+        assert back.ngram_type == "ngram-mod"
+
+    def test_legacy_config_without_ngram_key(self):
+        """Configs written before n-gram existed must still load (and stay off)."""
+        data = {"profile_name": "m", "gguf_file": "m.gguf"}
+        p = ModelProfile.from_dict(data)
+        assert p.ngram_enabled is False
+
+    def test_unknown_type_falls_back_to_default(self):
+        p = ModelProfile.from_dict(
+            {"profile_name": "m", "gguf_file": "m.gguf", "ngram_type": "ngram-bogus"})
+        assert p.ngram_type == "ngram-simple"
+
+    def test_normalize_accepts_gui_label_and_token(self):
+        from llamacpp_loader.config.store import (
+            NGRAM_LABELS, normalize_ngram_type, ngram_label)
+        assert normalize_ngram_type("Simple") == "ngram-simple"
+        assert normalize_ngram_type("ngram-mod") == "ngram-mod"
+        assert normalize_ngram_type("Off") == ""
+        assert normalize_ngram_type("") == ""
+        assert ngram_label("ngram-map-k") == "Map-K"
+        assert ngram_label("") == "Off"
+        # Every GUI label resolves to a real llama.cpp --spec-type token.
+        for label in NGRAM_LABELS:
+            assert normalize_ngram_type(label) in ("", *NGRAM_LABELS.values())
+
+    def test_persists_across_store_save(self, store, tmp_path):
+        store.add(ModelProfile(profile_name="m", gguf_file="m.gguf",
+                               model_path="/models"))
+        store.update("m", {"ngram_enabled": True, "ngram_type": "ngram-cache"})
+        reloaded = ConfigStore(path=tmp_path / "config.json")
+        assert reloaded.load("m").ngram_enabled is True
+        assert reloaded.load("m").ngram_type == "ngram-cache"

@@ -230,8 +230,9 @@ class TestModelDetailPanel:
         # Quick is deliberately balanced: four setting rows per column.
         assert {child.grid_info()["row"] for child in panel._quick_columns[0].grid_slaves()} == {0, 1, 2, 3}
         assert {child.grid_info()["row"] for child in panel._quick_columns[1].grid_slaves()} == {0, 1, 2, 3}
-        # Advanced is a four-row form, not four explanatory Configure buttons.
-        assert set(panel._capability_status) == {"vision_status", "mtp_status", "dflash_status"}
+        # Advanced is a five-row form, not four explanatory Configure buttons.
+        assert set(panel._capability_status) == {
+            "vision_status", "mtp_status", "dflash_status", "ngram_status"}
         assert panel._vars["cpu_moe_mode"].get() == "GPU all"
 
         panel._vars["ctx"].set("64")

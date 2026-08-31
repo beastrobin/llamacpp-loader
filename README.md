@@ -27,6 +27,7 @@ It folds the whole "pick a model → tune params → launch → test" workflow y
 | 🚀 **One-click launch** | Select model → Start → auto-spawns llama-server → health check passes → **opens the Web UI automatically** |
 | 🧪 **Smoke test** | `SmokeTestRunner` checks server health + `scripts/smoke_live.py` measures real throughput (tokens/s) |
 | 🛑 **Graceful shutdown** | Stops the process, releases VRAM/RAM, and supports crash auto-restart (watchdog) |
+| ⚡ **N-gram spec decoding** | Zero-cost speed-up (no draft model, no extra VRAM) that **stacks** with MTP / DFlash via llama.cpp's comma-separated `--spec-type` |
 
 ## 📦 Installation
 
@@ -48,7 +49,8 @@ python -m llamacpp_loader.main
 1. **Choose the llama.cpp folder**: click `llamacpp path` and select the directory containing `llama-server.exe`.
 2. **Add a model**: click `Add model` and choose a GGUF file; each model receives an independent profile.
 3. **Tune parameters**: use `Quick`, `Generation`, and `Advanced`. Quick uses context values in K, KV cache choices F16/Q8/Q4, GPU Auto/Recommend, and balanced 4+4 columns.
-4. **Configure optional capabilities**: Advanced provides aligned Vision, MTP, DFlash, and CPU-MoE rows with On/Off, file selection, clear, and status controls.
+4. **Configure optional capabilities**: Advanced provides aligned Vision, MTP, DFlash, and N-gram rows with On/Off, file selection, clear, and status controls. CPU-MoE lives in the Quick tab.
+   - **N-gram** is free acceleration (no draft model, no extra VRAM) and *stacks* with the draft tracks: picking `Simple` while MTP is on emits `--spec-type draft-mtp,ngram-simple`. Measured on Qwen3.8-27B: 57 t/s baseline → 87 t/s with MTP → ~117 t/s with MTP + n-gram.
 5. **Launch**: click `Start Server`; the app starts llama-server on the configured port and can open the local Web UI.
 6. **Smoke test**: click `Smoke Test` after launch, or run `python scripts/smoke_live.py` against a running local server.
 7. **Stop**: click `Stop Server` to shut down gracefully; model and layout settings are saved automatically.

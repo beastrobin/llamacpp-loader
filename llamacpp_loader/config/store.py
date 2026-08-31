@@ -44,6 +44,59 @@ def _clamp(val, lo, hi):
     return max(lo, min(hi, val))
 
 
+# N-gram speculative decoding (llama.cpp >= b10xxx).  These are *free*
+# accelerators: they need no draft model and no extra VRAM, they just reuse
+# repeated n-grams already present in the prompt / generated text.
+#
+# ``--spec-type`` accepts a comma-separated list, so an n-gram type can be
+# STACKED on top of a draft-based one (e.g. "draft-mtp,ngram-simple").  Measured
+# on Qwen3.8-27B: baseline 57 t/s -> draft-mtp 87 t/s -> draft-mtp + ngram 117
+# t/s, i.e. the n-gram half of the combo is worth more than the draft itself.
+NGRAM_TYPES: tuple[str, ...] = (
+    "ngram-simple",     # plain n-gram lookup, cheapest and usually best value
+    "ngram-map-k",      # n-gram map with K-entry value slots
+    "ngram-map-k4v",    # n-gram map, 4 value slots per key
+    "ngram-mod",        # modular n-gram, tunable via --spec-ngram-mod-n-*
+    "ngram-cache",      # n-gram backed by the prompt cache
+)
+
+# GUI label -> llama.cpp --spec-type token.
+NGRAM_LABELS: dict[str, str] = {
+    "Off": "",
+    "Simple": "ngram-simple",
+    "Map-K": "ngram-map-k",
+    "Map-K4V": "ngram-map-k4v",
+    "Mod": "ngram-mod",
+    "Cache": "ngram-cache",
+}
+
+DEFAULT_NGRAM_TYPE = "ngram-simple"
+
+
+def normalize_ngram_type(value: str) -> str:
+    """Return *value* if it is a known n-gram spec type, else ``""`` (off).
+
+    Accepts either a GUI label ("Simple") or a raw llama.cpp token
+    ("ngram-simple"), so callers can pass either form.
+    """
+    if not value:
+        return ""
+    v = str(value).strip()
+    if v in NGRAM_TYPES:
+        return v
+    if v in NGRAM_LABELS:
+        return NGRAM_LABELS[v]
+    return ""
+
+
+def ngram_label(spec_type: str) -> str:
+    """Inverse of :func:`normalize_ngram_type` — GUI label for a spec token."""
+    for label, token in NGRAM_LABELS.items():
+        if token == spec_type:
+            return label
+    return "Off"
+
+
 # --------------------------------------------------------------------------- data classes
 
 
@@ -212,6 +265,11 @@ class ModelProfile:
     cpu_moe: bool = False          # keep ALL MoE expert weights in CPU RAM (--cpu-moe)
     n_cpu_moe: int = 0             # keep first N layers' MoE experts in CPU (--n-cpu-moe N)
 
+    # N-gram speculative decoding — no draft model, no extra VRAM, and it can
+    # be STACKED on top of MTP/DFlash because --spec-type takes a comma list.
+    ngram_enabled: bool = False    # append an ngram type to --spec-type
+    ngram_type: str = DEFAULT_NGRAM_TYPE  # one of NGRAM_TYPES ("" means off)
+
     server: ServerParams = field(default_factory=ServerParams)
     inference: InferenceParams = field(default_factory=InferenceParams)
     sampling: SamplingParams = field(default_factory=SamplingParams)
@@ -337,6 +395,8 @@ class ModelProfile:
             "dflash_enabled": self.dflash_enabled,
             "cpu_moe": self.cpu_moe,
             "n_cpu_moe": self.n_cpu_moe,
+            "ngram_enabled": self.ngram_enabled,
+            "ngram_type": self.ngram_type,
             "server": self.server.to_dict(),
             "inference": self.inference.to_dict(),
             "sampling": self.sampling.to_dict(),
@@ -390,6 +450,11 @@ class ModelProfile:
             dflash_enabled=dflash_enabled,
             cpu_moe=bool(data.get("cpu_moe", False)),
             n_cpu_moe=int(data.get("n_cpu_moe", 0) or 0),
+            ngram_enabled=bool(data.get("ngram_enabled", False)),
+            # Tolerate legacy / hand-edited configs: an unknown n-gram token
+            # degrades to "" (off) instead of producing an invalid flag.
+            ngram_type=normalize_ngram_type(data.get("ngram_type", ""))
+            or DEFAULT_NGRAM_TYPE,
             server=ServerParams.from_dict(server_data),
             inference=InferenceParams.from_dict(inference_data),
             sampling=SamplingParams.from_dict(sampling_data),

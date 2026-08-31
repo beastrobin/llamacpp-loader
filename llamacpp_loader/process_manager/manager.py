@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Callable
 
+from ..config.store import normalize_ngram_type
+
 logger = logging.getLogger(__name__)
 
 
@@ -83,6 +85,11 @@ class ServerConfig:
     flash_attn: str = "auto"      # Flash Attention: "auto" | "on" | "off"
     cpu_moe: bool = False         # keep ALL MoE expert weights in CPU RAM (--cpu-moe)
     n_cpu_moe: int = 0            # keep first N layers' MoE experts in CPU (--n-cpu-moe N)
+    # N-gram speculative decoding: costs no VRAM and needs no draft model, and
+    # llama.cpp accepts a comma-separated --spec-type list, so it STACKS with
+    # the draft tracks above (e.g. "draft-mtp,ngram-simple").
+    ngram_enabled: bool = False   # append an n-gram type to --spec-type
+    ngram_type: str = "ngram-simple"  # ngram-simple / ngram-map-k / ngram-mod ...
 
 
 # --------------------------------------------------------------------------- helpers
@@ -244,6 +251,8 @@ class ProcessManager:
                 flash_attn=getattr(config.server, "flash_attn", "auto"),
                 cpu_moe=getattr(config, "cpu_moe", False),
                 n_cpu_moe=getattr(config, "n_cpu_moe", 0),
+                ngram_enabled=getattr(config, "ngram_enabled", False),
+                ngram_type=getattr(config, "ngram_type", "") or "ngram-simple",
             )
         elif isinstance(config, ServerConfig):
             sc = config
@@ -596,24 +605,45 @@ class ProcessManager:
                      and os.path.isfile(config.dflash_model))
         mtp_ext_ok = (config.mtp_enabled and config.mtp_model
                       and os.path.isfile(config.mtp_model))
+
+        # Resolve the draft-based track first (mutually exclusive).
+        draft_type = None
+        draft_model = None
+        draft_n_max = None
         if dflash_ok:
-            cmd.extend(["--spec-type", "draft-dflash"])
-            cmd.extend(["--spec-draft-model", config.dflash_model])
-            cmd.extend(["--spec-draft-n-max", str(config.dflash_n_max)])
+            draft_type = "draft-dflash"
+            draft_model = config.dflash_model
+            draft_n_max = config.dflash_n_max
         elif mtp_ext_ok:
             stem = config.mtp_model.lower().replace(" ", "-")
-            if "eagle" in stem:
-                draft_type = "draft-eagle3"
-            else:
-                draft_type = "draft-mtp"
-            cmd.extend(["--spec-type", draft_type])
-            cmd.extend(["--spec-draft-model", config.mtp_model])
-            cmd.extend(["--spec-draft-n-max", str(config.mtp_n_max)])
+            draft_type = "draft-eagle3" if "eagle" in stem else "draft-mtp"
+            draft_model = config.mtp_model
+            draft_n_max = config.mtp_n_max
         elif config.mtp_enabled and config.mtp_native:
-            cmd.extend(["--spec-type", "draft-mtp"])
-            cmd.extend(["--spec-draft-n-max", str(config.mtp_n_max)])
-        elif (config.dflash_enabled and config.dflash_model) or (
-                config.mtp_enabled and config.mtp_model):
+            draft_type = "draft-mtp"
+            draft_n_max = config.mtp_n_max
+
+        # N-gram track: free, stackable, and valid on its own.  --spec-type
+        # takes a comma-separated list, so it is appended to (not replaces) the
+        # draft track above.
+        ngram_type = ""
+        if getattr(config, "ngram_enabled", False):
+            ngram_type = normalize_ngram_type(getattr(config, "ngram_type", ""))
+            if not ngram_type:
+                self._forward_log(
+                    f"unknown n-gram spec type {config.ngram_type!r}, ignoring")
+
+        spec_types = [t for t in (draft_type, ngram_type) if t]
+        if spec_types:
+            # Single flag, comma-joined: llama.cpp parses this as a list.
+            cmd.extend(["--spec-type", ",".join(spec_types)])
+        if draft_model:
+            cmd.extend(["--spec-draft-model", draft_model])
+        if draft_n_max is not None:
+            cmd.extend(["--spec-draft-n-max", str(draft_n_max)])
+
+        if not draft_type and ((config.dflash_enabled and config.dflash_model) or (
+                config.mtp_enabled and config.mtp_model)):
             missing = config.dflash_model or config.mtp_model
             self._forward_log(
                 f"draft model not found, skipping speculative decoding: {missing}")
