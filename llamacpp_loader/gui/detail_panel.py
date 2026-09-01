@@ -224,7 +224,23 @@ class ModelDetailPanel(ttk.Frame):
                    command=lambda p=prefix: self._action(f"{p}_pick")).grid(row=0, column=2, padx=2, pady=2, ipady=3)
         ttk.Button(line, text="Clear", width=9, style="DetailAction.TButton",
                    command=lambda p=prefix: self._action(f"{p}_clear")).grid(row=0, column=3, padx=(2, 0), pady=2, ipady=3)
-        self._add_status_entry(line, 0, f"{prefix}_status", column=4)
+        if prefix == "mtp":
+            # Keep the speculative draft budget next to MTP so it is visible
+            # and editable without the model-list context menu.
+            ttk.Label(line, text="n-max").grid(row=0, column=4, sticky=tk.W,
+                                                padx=(8, 2), pady=2)
+            n_max = tk.StringVar(value="7")
+            self._vars["mtp_n_max"] = n_max
+            entry = ttk.Spinbox(line, from_=1, to=16, textvariable=n_max,
+                                width=5, state="normal")
+            entry.grid(row=0, column=5, sticky=tk.W, padx=(2, 4), pady=2)
+            self._inputs["mtp_n_max"] = entry
+            entry.bind("<Return>", lambda _e: self._commit_mtp_n_max())
+            entry.bind("<FocusOut>", lambda _e: self._commit_mtp_n_max())
+            self._add_status_entry(line, 0, "mtp_status", column=6)
+            line.columnconfigure(6, weight=1)
+        else:
+            self._add_status_entry(line, 0, f"{prefix}_status", column=4)
 
     def _add_cpu_moe_row(self, parent, row):
         # This lives beside GPU layers in Quick, so use its parent grid
@@ -274,6 +290,20 @@ class ModelDetailPanel(ttk.Frame):
         if self._loading or not self._profile_name:
             return
         self._on_change(self._profile_name, {f"{prefix}_enabled": self._vars[f"{prefix}_enabled"].get() == "On"})
+
+    def _commit_mtp_n_max(self):
+        if self._loading or not self._profile_name:
+            return
+        try:
+            value = int(self._vars["mtp_n_max"].get())
+        except (TypeError, ValueError):
+            value = 0
+        if not 1 <= value <= 16:
+            if self._hint is not None:
+                self._hint.config(text="MTP n-max must be an integer from 1 to 16.",
+                                  foreground=theme.AMBER)
+            return
+        self._on_change(self._profile_name, {"mtp_n_max": value})
 
     def _commit_vision(self):
         if self._loading or not self._profile_name:
@@ -343,6 +373,7 @@ class ModelDetailPanel(ttk.Frame):
             self._vars["vision_enabled"].set("On" if vision else "Off")
             self._vars["vision_status"].set(Path(vision).name if vision else "Not attached")
             self._vars["mtp_enabled"].set("On" if profile.mtp_enabled else "Off")
+            self._vars["mtp_n_max"].set(str(max(1, min(16, int(getattr(profile, "mtp_n_max", 7) or 7)))))
             mtp_status = profile.mtp_model or ("Native (in-model)" if profile.mtp_native else "Not attached")
             self._vars["mtp_status"].set(Path(mtp_status).name if profile.mtp_model else mtp_status)
             self._vars["dflash_enabled"].set("On" if profile.dflash_enabled else "Off")

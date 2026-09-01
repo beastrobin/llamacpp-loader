@@ -235,6 +235,9 @@ class TestModelDetailPanel:
         # Advanced is a four-row form, not four explanatory Configure buttons.
         assert set(panel._capability_status) == {
             "vision_status", "mtp_status", "dflash_status", "ngram_status"}
+        assert panel._vars["mtp_n_max"].get() == "7"
+        assert panel._inputs["mtp_n_max"].cget("from") == 1.0
+        assert panel._inputs["mtp_n_max"].cget("to") == 16.0
         assert panel._vars["cpu_moe_mode"].get() == "GPU all"
         assert panel._inputs["cpu_moe_layers"].master is panel._quick_columns[0]
         assert panel._inputs["cpu_moe_mode"].grid_info()["column"] == panel._inputs["gpu"].grid_info()["column"]
@@ -250,10 +253,13 @@ class TestModelDetailPanel:
 
         panel._vars["mtp_enabled"].set("On")
         panel._commit_capability("mtp")
+        panel._vars["mtp_n_max"].set("4")
+        panel._commit_mtp_n_max()
         panel._vars["cpu_moe_mode"].set("First N")
         panel._vars["cpu_moe_layers"].set("12")
         panel._commit_cpu_moe()
         assert ("demo", {"mtp_enabled": True}) in changes
+        assert ("demo", {"mtp_n_max": 4}) in changes
         assert ("demo", {"cpu_moe": False, "n_cpu_moe": 12}) in changes
 
 
