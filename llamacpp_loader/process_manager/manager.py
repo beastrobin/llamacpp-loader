@@ -7,6 +7,7 @@ graceful shutdown, crash-restart, and automatic browser launch on successful sta
 from __future__ import annotations
 
 import ctypes
+import ipaddress
 import json
 import logging
 import os
@@ -98,46 +99,58 @@ def _is_windows() -> bool:
     return platform.system().lower().startswith("win")
 
 
-def _resolve_llama_server_executable(model_path: str = "", config_root: str = "") -> str:
-    """Locate llama-server.exe / llama-server.
+def _resolve_llama_server_executable(config_root: str = "") -> str:
+    """Locate llama-server without searching model directories.
 
-    Resolution order:
-      1. If *config_root* (user-configured llama.cpp install dir) is given and
-         contains llama-server.exe, use that.
-      2. Walk up from *model_path* looking for a directory that contains
-         llama-server.exe.
-      3. Walk up from *config_root* the same way.
-      4. Fall back to PATH lookup.
-      5. Final fallback: just the bare name.
+    A configured llama.cpp directory is an explicit trust decision and is
+    therefore used only as selected.  Model directories are data locations,
+    not executable search roots.  Callers without a configuration store retain
+    the legacy PATH fallback for programmatic use.
     """
     import shutil
     exe_win = "llama-server.exe"
     exe_nix = "llama-server"
 
-    def try_dir(d: str) -> str | None:
-        if not d:
-            return None
-        p = Path(d)
-        for _ in range(8):  # walk up to 8 levels
-            for n in (exe_win, exe_nix):
-                cand = p / n
-                if cand.is_file():
-                    return str(cand)
-            if p.parent == p:
-                break
-            p = p.parent
-        return None
+    if config_root:
+        root = Path(config_root).expanduser()
+        candidates = (root,) if root.is_file() else (
+            root / exe_win,
+            root / exe_nix,
+        )
+        for candidate in candidates:
+            if candidate.is_file() and candidate.name.lower() in {
+                exe_win, exe_nix,
+            }:
+                return str(candidate)
+        raise FileNotFoundError(
+            "Configured llama.cpp folder does not contain llama-server(.exe): "
+            f"{config_root}"
+        )
 
-    # 1. config_root
-    for n in (try_dir(config_root), try_dir(model_path)):
-        if n:
-            return n
-    # 2. PATH
+    # Programmatic callers that do not use ConfigStore retain PATH fallback.
     found = shutil.which(exe_nix) or shutil.which(exe_win)
     if found:
         return found
-    # 3. Bare name
     return exe_win if os.name == "nt" else exe_nix
+
+
+def _normalize_loopback_host(host: str) -> str:
+    """Return a loopback bind address or reject network-visible hosts."""
+    value = str(host or "").strip()
+    if not value or value.lower() == "localhost":
+        return "127.0.0.1"
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError as exc:
+        raise ValueError(
+            "Refusing to bind llama-server to a hostname. "
+            "Only loopback IP addresses are supported."
+        ) from exc
+    if not address.is_loopback:
+        raise ValueError(
+            f"Refusing to expose llama-server on non-loopback host: {value}"
+        )
+    return str(address)
 
 
 # --------------------------------------------------------------------------- process manager
@@ -171,7 +184,7 @@ class ProcessManager:
         self._state = ProcessState.IDLE
         self._output_thread: Optional[threading.Thread] = None
         self._watcher_thread: Optional[threading.Thread] = None
-        # Cached llama-server path; auto-detected on first start, persisted later
+        # Last resolved llama-server path, used only for registry metadata.
         self._config_store = config_store
         self._cached_server_path: Optional[str] = None
 
@@ -261,6 +274,7 @@ class ProcessManager:
             return False
 
         # Start the process
+        cmd: list[str] = []
         try:
             cmd = self._build_command(sc)
             # Log the full command line so the operator can verify flags like
@@ -279,7 +293,7 @@ class ProcessManager:
                 # llama-server subprocess (e.g. triggered by Smoke Test).
                 creationflags=0x08000000 if os.name == "nt" else 0,
             )
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             import traceback
             self._forward_log(f"Failed to start process: {exc}")
             self._forward_log(f"Traceback:\n{traceback.format_exc()}")
@@ -508,7 +522,10 @@ class ProcessManager:
 
         Returns a flat list of command-line arguments suitable for subprocess.Popen.
         """
-        # Determine llama-server executable path
+        host = _normalize_loopback_host(config.host)
+
+        # The desktop application must use an explicitly chosen llama.cpp
+        # directory.  Do not infer executable trust from a model path.
         config_root = ""
         if self._config_store is not None:
             try:
@@ -516,9 +533,14 @@ class ProcessManager:
                 config_root = ui.llama_server_path or ""
             except Exception:
                 pass
-        exe = self._cached_server_path or _resolve_llama_server_executable(
-            config.model_path, config_root=config_root)
-        # Cache for next time
+            if not config_root:
+                raise ValueError(
+                    "Choose the llama.cpp folder containing llama-server(.exe) "
+                    "before starting a model."
+                )
+        exe = _resolve_llama_server_executable(config_root=config_root)
+        # Keep the current resolved path only for registry metadata; always
+        # resolve again on launch so a changed configured folder takes effect.
         self._cached_server_path = exe
         cmd = [exe]
 
@@ -526,7 +548,7 @@ class ProcessManager:
             cmd.extend(["--model", config.model_path])
 
         cmd.extend([
-            "--host", config.host,
+            "--host", host,
             "--port", str(config.port),
             "-c", str(config.ctx_size),
         ])

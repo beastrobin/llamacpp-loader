@@ -1577,6 +1577,14 @@ class MainWindow:
             initialdir=init if os.path.isdir(init) else "")
         if not d:
             return
+        if not any((Path(d) / name).is_file()
+                   for name in ("llama-server.exe", "llama-server")):
+            messagebox.showerror(
+                "llamacpp path",
+                "The selected folder does not contain llama-server(.exe).\n\n"
+                "Choose the llama.cpp build folder that contains the server binary.",
+            )
+            return
         self.store.set_ui_state(llama_server_path=d)
         self._refresh_llamacpp_path_display()
         messagebox.showinfo(

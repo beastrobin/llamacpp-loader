@@ -1,9 +1,13 @@
 """Tests for process_manager.manager module."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, PropertyMock
 import pytest
 
-from llamacpp_loader.process_manager.manager import ServerConfig, ProcessManager
+from llamacpp_loader.process_manager.manager import (
+    ServerConfig,
+    ProcessManager,
+)
 
 
 class TestServerConfig:
@@ -43,6 +47,58 @@ class TestProcessManagerInitialState:
 
 
 class TestProcessManagerBuildCommand:
+
+    def test_configured_folder_wins_over_model_directory_binary(self, tmp_path):
+        install_dir = tmp_path / "llama.cpp"
+        install_dir.mkdir()
+        trusted_server = install_dir / "llama-server.exe"
+        trusted_server.write_bytes(b"")
+        model_dir = tmp_path / "models"
+        model_dir.mkdir()
+        (model_dir / "llama-server.exe").write_bytes(b"")
+
+        store = MagicMock()
+        store.get_ui_state.return_value = SimpleNamespace(
+            llama_server_path=str(install_dir)
+        )
+        command = ProcessManager(config_store=store)._build_command(
+            ServerConfig(model_path=str(model_dir / "model.gguf"))
+        )
+
+        assert command[0] == str(trusted_server)
+
+    def test_invalid_configured_folder_does_not_fall_back_to_path(self, tmp_path):
+        store = MagicMock()
+        store.get_ui_state.return_value = SimpleNamespace(
+            llama_server_path=str(tmp_path / "missing")
+        )
+        with patch("shutil.which", return_value="attacker-server") as which:
+            with pytest.raises(FileNotFoundError, match="does not contain"):
+                ProcessManager(config_store=store)._build_command(ServerConfig())
+        which.assert_not_called()
+
+    def test_config_store_requires_explicit_server_folder(self):
+        store = MagicMock()
+        store.get_ui_state.return_value = SimpleNamespace(llama_server_path="")
+        with pytest.raises(ValueError, match="Choose the llama.cpp folder"):
+            ProcessManager(config_store=store)._build_command(ServerConfig())
+
+    @pytest.mark.parametrize("host", ["0.0.0.0", "::", "192.168.1.10", "example.com"])
+    def test_rejects_non_loopback_bind_addresses(self, host):
+        with pytest.raises(ValueError, match="Refusing"):
+            ProcessManager(log_callback=None)._build_command(ServerConfig(host=host))
+
+    def test_normalizes_localhost_to_loopback(self):
+        command = ProcessManager(log_callback=None)._build_command(
+            ServerConfig(host="localhost")
+        )
+        assert command[command.index("--host") + 1] == "127.0.0.1"
+
+    @patch("llamacpp_loader.process_manager.manager.subprocess.Popen")
+    def test_start_rejects_non_loopback_before_popen(self, mock_popen):
+        result = ProcessManager(log_callback=None).start(ServerConfig(host="0.0.0.0"))
+        assert result is False
+        mock_popen.assert_not_called()
 
     @patch("llamacpp_loader.process_manager.manager.subprocess.Popen")
     def test_includes_model_path(self, mock_popen):
