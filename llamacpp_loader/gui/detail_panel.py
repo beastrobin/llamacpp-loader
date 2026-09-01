@@ -105,8 +105,8 @@ class ModelDetailPanel(ttk.Frame):
         advanced.columnconfigure(0, weight=1)
         self._add_vision_row(advanced, 0)
         self._add_draft_row(advanced, 1, "MTP", "mtp")
-        self._add_draft_row(advanced, 2, "DFlash", "dflash")
-        self._add_ngram_row(advanced, 3)
+        self._add_ngram_row(advanced, 2)
+        self._add_draft_row(advanced, 3, "DFlash", "dflash")
         self._hint = None
         self._bind_mousewheel(self)
         self.after_idle(self._sync_scrollregion)
