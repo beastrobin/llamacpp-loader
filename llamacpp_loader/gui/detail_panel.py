@@ -102,6 +102,9 @@ class ModelDetailPanel(ttk.Frame):
         gen_fields = (("Temperature", "temp", "0.7"), ("Top-K", "topk", "40"), ("Top-P", "topp", "0.95"), ("Repeat penalty", "repeat", "1.1"), ("Seed", "seed", "-1"), ("Frequency penalty", "frequency", "0.0"), ("Presence penalty", "presence", "0.0"))
         for row, item in enumerate(gen_fields[:4]): self._add_field(g_left, row, *item, "")
         for row, item in enumerate(gen_fields[4:]): self._add_field(g_right, row, *item, "")
+        # Max tokens caps --n-predict so a long thinking trace cannot swallow
+        # the whole generation budget; 0 keeps llama.cpp's default (unbounded).
+        self._add_field(g_right, 3, "Max tokens", "max_tokens", "0", "0 = auto")
         advanced.columnconfigure(0, weight=1)
         self._add_vision_row(advanced, 0)
         self._add_draft_row(advanced, 1, "MTP", "mtp")
@@ -344,7 +347,7 @@ class ModelDetailPanel(ttk.Frame):
     def _commit(self, key, preset=False):
         if self._loading or not self._profile_name: return
         if preset: return self._on_preset(self._profile_name, self._vars[key].get())
-        paths = {"ctx": ("inference.ctx_size", lambda v: int(float(v)*1024)), "gpu": ("inference.gpu_layers", int), "threads": ("inference.n_threads", int), "batch": ("inference.n_batch", int), "parallel": ("inference.n_parallel", int), "seed": ("inference.seed", int), "temp": ("sampling.temperature", float), "topk": ("sampling.top_k", int), "topp": ("sampling.top_p", float), "repeat": ("sampling.repeat_penalty", float), "frequency": ("sampling.frequency_penalty", float), "presence": ("sampling.presence_penalty", float), "kv": ("kv_cache", lambda v: {"F16":"f16", "Q8":"q8_0", "Q4":"q4_0"}.get(v, v.lower())), "flash": ("server.flash_attn", str), "reasoning": ("reasoning", lambda v: v == "on")}
+        paths = {"ctx": ("inference.ctx_size", lambda v: int(float(v)*1024)), "gpu": ("inference.gpu_layers", int), "threads": ("inference.n_threads", int), "batch": ("inference.n_batch", int), "parallel": ("inference.n_parallel", int), "seed": ("inference.seed", int), "max_tokens": ("inference.n_predict", lambda v: max(0, int(v))), "temp": ("sampling.temperature", float), "topk": ("sampling.top_k", int), "topp": ("sampling.top_p", float), "repeat": ("sampling.repeat_penalty", float), "frequency": ("sampling.frequency_penalty", float), "presence": ("sampling.presence_penalty", float), "kv": ("kv_cache", lambda v: {"F16":"f16", "Q8":"q8_0", "Q4":"q4_0"}.get(v, v.lower())), "flash": ("server.flash_attn", str), "reasoning": ("reasoning", lambda v: v == "on")}
         try: path, conv = paths[key]; self._on_change(self._profile_name, {path: conv(self._vars[key].get())})
         except (KeyError, TypeError, ValueError):
             if self._hint is not None:
@@ -367,7 +370,7 @@ class ModelDetailPanel(ttk.Frame):
             ctx_k = str(i.ctx_size // 1024)
             if ctx_k not in ("32", "64", "128", "256", "512"):
                 ctx_k = min(("32", "64", "128", "256", "512"), key=lambda x: abs(int(x) - i.ctx_size // 1024))
-            vals = {"ctx": ctx_k, "gpu": i.gpu_layers, "kv": {"q8_0":"Q8", "q4_0":"Q4"}.get(profile.kv_cache, "F16"), "threads": i.n_threads, "flash": profile.server.flash_attn, "reasoning": "on" if profile.reasoning else "off", "temp": s.temperature, "topk": s.top_k, "topp": s.top_p, "repeat": s.repeat_penalty, "seed": i.seed, "frequency": s.frequency_penalty, "presence": s.presence_penalty, "batch": i.n_batch, "parallel": i.n_parallel}
+            vals = {"ctx": ctx_k, "gpu": i.gpu_layers, "kv": {"q8_0":"Q8", "q4_0":"Q4"}.get(profile.kv_cache, "F16"), "threads": i.n_threads, "flash": profile.server.flash_attn, "reasoning": "on" if profile.reasoning else "off", "temp": s.temperature, "topk": s.top_k, "topp": s.top_p, "repeat": s.repeat_penalty, "seed": i.seed, "frequency": s.frequency_penalty, "presence": s.presence_penalty, "batch": i.n_batch, "parallel": i.n_parallel, "max_tokens": i.n_predict or 0}
             for k, v in vals.items(): self._vars[k].set(v)
             vision = next((f for f in profile.extra_files if "mmproj" in f.lower() or "clip" in f.lower()), "")
             self._vars["vision_enabled"].set("On" if vision else "Off")

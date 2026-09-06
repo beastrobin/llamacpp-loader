@@ -213,7 +213,8 @@ class TestModelDetailPanel:
         panel.set_profile(ModelProfile(
             profile_name="demo", display_name="Demo",
             model_path=str(tmp_path), gguf_file=model.name,
-            kv_cache="q8_0", inference=InferenceParams(ctx_size=32768)))
+            kv_cache="q8_0",
+            inference=InferenceParams(ctx_size=32768, n_predict=12000)))
 
         assert panel._vars["ctx"].get() == "32"
         assert panel._vars["kv"].get() == "Q8"
@@ -238,6 +239,8 @@ class TestModelDetailPanel:
         assert panel._vars["mtp_n_max"].get() == "7"
         assert panel._inputs["mtp_n_max"].cget("from") == 1.0
         assert panel._inputs["mtp_n_max"].cget("to") == 16.0
+        # Max tokens row: maps to inference.n_predict and shows 0 = auto.
+        assert panel._vars["max_tokens"].get() == "12000"
         assert panel._vars["cpu_moe_mode"].get() == "GPU all"
         assert panel._inputs["cpu_moe_layers"].master is panel._quick_columns[0]
         assert panel._inputs["cpu_moe_mode"].grid_info()["column"] == panel._inputs["gpu"].grid_info()["column"]

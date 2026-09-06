@@ -456,3 +456,40 @@ class TestNgramConfig:
         reloaded = ConfigStore(path=tmp_path / "config.json")
         assert reloaded.load("m").ngram_enabled is True
         assert reloaded.load("m").ngram_type == "ngram-cache"
+
+
+# ============================================================ n_predict (Max tokens)
+
+
+class TestNPredict:
+    """n_predict caps per-request generation; 0 keeps the server default."""
+
+    def test_defaults_to_unset(self):
+        from llamacpp_loader.config.store import InferenceParams
+        assert InferenceParams().n_predict == 0
+
+    def test_validated_non_negative(self):
+        from llamacpp_loader.config.store import InferenceParams
+        assert InferenceParams(n_predict=-5).n_predict == 0
+        assert InferenceParams(n_predict=12000).n_predict == 12000
+
+    def test_round_trips_through_dict(self):
+        from llamacpp_loader.config.store import InferenceParams
+        back = InferenceParams.from_dict({"n_predict": 12000})
+        assert back.n_predict == 12000
+        assert InferenceParams.from_dict({}).n_predict == 0
+
+    def test_set_n_predict_clamps(self):
+        from llamacpp_loader.config.store import InferenceParams
+        ip = InferenceParams()
+        ip.set_n_predict(8000)
+        assert ip.n_predict == 8000
+        ip.set_n_predict(-1)
+        assert ip.n_predict == 0
+
+    def test_profile_round_trips_n_predict(self):
+        from llamacpp_loader.config.store import InferenceParams, ModelProfile
+        p = ModelProfile(profile_name="m", gguf_file="m.gguf",
+                         inference=InferenceParams(n_predict=12000))
+        back = ModelProfile.from_dict(p.to_dict())
+        assert back.inference.n_predict == 12000

@@ -166,12 +166,18 @@ class InferenceParams:
     n_batch: int = 512         # prompt processing batch size
     n_parallel: int = 1        # number of parallel sequences (speculative decoding)
     seed: int = -1             # -1 = random seed each run
+    n_predict: int = 0         # max tokens to generate per request (--n-predict).
+                               # 0 = leave llama.cpp's default (-1, run until
+                               # EOS or the context fills).  A large-but-bounded
+                               # value (e.g. 12000) stops long thinking traces
+                               # from silently eating a small client budget.
 
     def __post_init__(self):
         object.__setattr__(self, "ctx_size", max(64, self.ctx_size))
         object.__setattr__(self, "n_threads", max(1, self.n_threads))
         object.__setattr__(self, "n_batch", max(1, min(self.n_batch, 8192)))
         object.__setattr__(self, "seed", -1 if self.seed < 0 else self.seed)
+        object.__setattr__(self, "n_predict", max(0, self.n_predict))
 
     # --- validation helpers for runtime mutation ---
     def set_ctx_size(self, val):
@@ -182,6 +188,9 @@ class InferenceParams:
 
     def set_n_batch(self, val):
         object.__setattr__(self, "n_batch", max(1, min(int(val), 8192)))
+
+    def set_n_predict(self, val):
+        object.__setattr__(self, "n_predict", max(0, int(val)))
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

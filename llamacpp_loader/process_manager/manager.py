@@ -7,11 +7,13 @@ graceful shutdown, crash-restart, and automatic browser launch on successful sta
 from __future__ import annotations
 
 import ctypes
+import functools
 import ipaddress
 import json
 import logging
 import os
 import platform
+import re
 import signal
 import subprocess
 import tempfile
@@ -38,6 +40,54 @@ class ProcessState(Enum):
     RUNNING = "running"
     STOPPING = "stopping"
     ERROR = "error"
+
+
+# --------------------------------------------------------------------------- reasoning-off guard
+
+#: Minimum llama.cpp *build* number that safely accepts ``--reasoning off``
+#: as the server default.  Builds at/below the 2026-09-05 boundary (b10588)
+#: crash the chat endpoint on the first request when the server default is
+#: ``off`` (verified on Qwen3.6 / Gemma-4 / Qwen3.8 thinking models — the
+#: process dies silently or returns 502).  Until upstream ships a fix this
+#: stays ``None`` (never auto-emit); bump it to the fixed build when known.
+REASONING_OFF_MIN_BUILD: Optional[int] = None
+
+#: env override to force ``--reasoning off`` even on a buggy build (opt-in
+#: escape hatch, e.g. to test a newer llama.cpp nightly by hand).
+REASONING_OFF_ENV = "LLAMACPP_REASONING_OFF"
+
+_BUILD_RE = re.compile(r"\bbuild\s+(\d+)\b", re.IGNORECASE)
+
+
+@functools.lru_cache(maxsize=8)
+def _probe_server_build(exe: str) -> Optional[int]:
+    """Parse the llama.cpp build number from ``exe --version`` (cached)."""
+    try:
+        proc = subprocess.run(
+            [exe, "--version"], capture_output=True, text=True,
+            timeout=10, check=False,
+        )
+        combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        match = _BUILD_RE.search(combined)
+        return int(match.group(1)) if match else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def reasoning_off_allowed(exe: str) -> bool:
+    """Whether emitting ``--reasoning off`` is safe for *exe*.
+
+    Off is allowed when the operator opts in via env, or when the probed
+    build is known to handle it (>= REASONING_OFF_MIN_BUILD).  On unknown or
+    buggy builds we refuse: the flag would disable thinking for *every*
+    client, and on b10588 that crashes the server.
+    """
+    if os.environ.get(REASONING_OFF_ENV, "").strip() in ("1", "true", "yes"):
+        return True
+    if REASONING_OFF_MIN_BUILD is None:
+        return False
+    build = _probe_server_build(exe)
+    return build is not None and build >= REASONING_OFF_MIN_BUILD
 
 
 @dataclass(slots=True)
@@ -74,6 +124,7 @@ class ServerConfig:
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
     kv_cache: str = "f16"          # f16 / q8_0 / q4_0
+    n_predict: int = 0             # per-request max tokens (--n-predict); 0 = server default
     reasoning: bool = False        # --reasoning on/off
     mmproj: str = ""               # vision projector GGUF path (--mmproj)
     mtp_enabled: bool = False      # use an MTP draft model (speculative decoding)
@@ -252,6 +303,7 @@ class ProcessManager:
                 frequency_penalty=sampling.frequency_penalty,
                 presence_penalty=sampling.presence_penalty,
                 kv_cache=config.kv_cache,
+                n_predict=getattr(config.inference, "n_predict", 0),
                 reasoning=config.reasoning,
                 mmproj=mmproj,
                 mtp_enabled=config.mtp_enabled,
@@ -671,11 +723,26 @@ class ProcessManager:
                 f"draft model not found, skipping speculative decoding: {missing}")
 
         # Reasoning toggle (llama-server >= b4xxx supports --reasoning on/off).
-        # Only emit when enabling reasoning — "off" is the server default, so
-        # omitting it keeps us compatible with older llama-server builds that
-        # reject the unknown flag.
+        #   - ON: emitted whenever the profile enables thinking.  Safe on every
+        #     build that knows the flag (auto-thinking templates need it to be
+        #     explicit when a request does not set enable_thinking).
+        #   - OFF: *not* emitted blindly.  On builds around b10588 the server
+        #     crashes on the first chat request when its default is off
+        #     (verified 2026-09-05 across three thinking-template models), so
+        #     we gate it behind reasoning_off_allowed() (env override or a
+        #     fixed upstream build — see REASONING_OFF_MIN_BUILD).  Until then
+        #     we warn once: clients must send enable_thinking=false themselves.
         if config.reasoning:
             cmd.extend(["--reasoning", "on"])
+        elif reasoning_off_allowed(exe):
+            cmd.extend(["--reasoning", "off"])
+        elif not getattr(self, "_reasoning_off_warned", False):
+            self._reasoning_off_warned = True
+            self._forward_log(
+                "reasoning is off in the profile, but this llama.cpp build "
+                "cannot safely disable it server-side (b10588-era builds crash "
+                "on --reasoning off). Clients talking to this server must send "
+                "enable_thinking=false per request for thinking-template models.")
 
         # Flash Attention — "auto" lets llama-server enable it when the GPU /
         # driver supports it ("on" forces it, "off" disables).  Always emitted
@@ -697,6 +764,13 @@ class ProcessManager:
             cmd.extend(["--frequency-penalty", str(config.frequency_penalty)])
         if config.presence_penalty:
             cmd.extend(["--presence-penalty", str(config.presence_penalty)])
+
+        # Per-request token cap.  The server default (-1) runs until EOS or
+        # the context fills, which lets a long thinking trace swallow the whole
+        # budget before any answer appears; an explicit cap (e.g. 12000) keeps
+        # generation bounded for thinking-template models.
+        if config.n_predict > 0:
+            cmd.extend(["--n-predict", str(config.n_predict)])
 
         self._forward_log(f"Command: {' '.join(cmd)}")
         return cmd

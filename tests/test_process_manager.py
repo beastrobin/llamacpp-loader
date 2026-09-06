@@ -320,3 +320,69 @@ class TestBrowserOpen:
         mgr = ProcessManager(log_callback=None)
         mgr._open_browser(8080)
         mock_open.assert_called_once_with("http://localhost:8080")
+
+
+# ==================================================== reasoning-off guard + n_predict
+
+
+class TestReasoningOffGuard:
+    """--reasoning off must never be emitted on buggy/unknown llama.cpp builds.
+
+    b10588-era builds crash the chat endpoint when the server default is off
+    (verified 2026-09-05), so the loader refuses unless the operator opts in
+    via env or the build is known fixed (REASONING_OFF_MIN_BUILD).
+    """
+
+    def test_reasoning_on_is_always_emitted(self):
+        cmd = ProcessManager(log_callback=None)._build_command(
+            ServerConfig(model_path="/m.gguf", port=9001, reasoning=True))
+        i = cmd.index("--reasoning")
+        assert cmd[i + 1] == "on"
+
+    def test_reasoning_off_omitted_without_env_or_fixed_build(self):
+        """Default path: no flag at all + a guidance warning (not a crash)."""
+        from llamacpp_loader.process_manager import manager
+        lines = []
+        mgr = ProcessManager(log_callback=lines.append)
+        cmd = mgr._build_command(ServerConfig(model_path="/m.gguf", port=9001))
+        assert "--reasoning" not in cmd
+        assert any("enable_thinking=false" in ln for ln in lines)
+        # Clean up the once-per-instance warning latch for other tests.
+        mgr._reasoning_off_warned = True
+
+    def test_reasoning_off_emitted_when_env_override_set(self, monkeypatch):
+        monkeypatch.setenv("LLAMACPP_REASONING_OFF", "1")
+        cmd = ProcessManager(log_callback=None)._build_command(
+            ServerConfig(model_path="/m.gguf", port=9001))
+        assert cmd[cmd.index("--reasoning") + 1] == "off"
+
+    def test_reasoning_off_allowed_gates_on_fixed_build(self, monkeypatch):
+        from llamacpp_loader.process_manager import manager
+        monkeypatch.setattr(manager, "REASONING_OFF_MIN_BUILD", 20000)
+        monkeypatch.setattr(
+            manager, "_probe_server_build", staticmethod(lambda exe: 25000))
+        assert manager.reasoning_off_allowed("/x/llama-server.exe") is True
+        # Buggy build (b10588) still refuses even with a threshold set.
+        monkeypatch.setattr(
+            manager, "_probe_server_build", staticmethod(lambda exe: 10588))
+        assert manager.reasoning_off_allowed("/x/llama-server.exe") is False
+
+    def test_reasoning_off_refused_on_unknown_build(self, monkeypatch):
+        from llamacpp_loader.process_manager import manager
+        monkeypatch.setattr(manager, "REASONING_OFF_MIN_BUILD", 20000)
+        monkeypatch.setattr(
+            manager, "_probe_server_build", staticmethod(lambda exe: None))
+        assert manager.reasoning_off_allowed("/x/llama-server.exe") is False
+
+
+class TestNPredictEmission:
+
+    def test_n_predict_emitted_when_set(self):
+        cmd = ProcessManager(log_callback=None)._build_command(
+            ServerConfig(model_path="/m.gguf", port=9001, n_predict=12000))
+        assert cmd[cmd.index("--n-predict") + 1] == "12000"
+
+    def test_n_predict_omitted_when_zero(self):
+        cmd = ProcessManager(log_callback=None)._build_command(
+            ServerConfig(model_path="/m.gguf", port=9001))
+        assert "--n-predict" not in cmd
