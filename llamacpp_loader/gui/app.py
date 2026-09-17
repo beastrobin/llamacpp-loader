@@ -180,21 +180,40 @@ class MainWindow:
         Also scans for out-of-memory signatures so an OOM failure is surfaced
         in the Test Results panel (not just the Server Output console).
         """
-        self.root.after(0, lambda: self._console_panel.append_line(line))
+        self._post_to_ui(self._console_panel.append_line, line)
         low = line.lower()
         if any(k in low for k in (
             "out of memory", "failed to allocate", "cuda error",
             "not enough memory", "could not allocate", "cudamalloc",
             "cumemalloc", "ggml_cuda_host_malloc",
         )):
-            self.root.after(0, lambda ln=line: self._report_oom(ln))
+            self._post_to_ui(self._report_oom, line)
 
     def _report_oom(self, line: str) -> None:
         """Surface an out-of-memory error in the Test Results panel."""
         try:
             self._test_panel.append_line(f"[OOM] {line}")
             self._status_bar.set_state("error", "Out of memory - VRAM exhausted")
-        except Exception:
+        except Exception:  # noqa: BLE001 — reporting must never break the UI
+            logger.warning("Could not surface the OOM message", exc_info=True)
+
+    def _post_to_ui(self, func, *args) -> None:
+        """Schedule *func* on the Tk main thread, tolerating a dead window.
+
+        Log lines and smoke-test results arrive from background threads that can
+        outlive the window the user just closed; ``root.after`` then raises
+        ``TclError``.  Dropping such an update is correct — letting the
+        exception escape would kill the worker thread instead.
+        """
+        def _run() -> None:
+            try:
+                func(*args)
+            except Exception:  # noqa: BLE001 — widget may already be gone
+                logger.debug("UI update after teardown ignored", exc_info=True)
+
+        try:
+            self.root.after(0, _run)
+        except Exception:  # noqa: BLE001 — root already destroyed
             pass
 
     def _recover_existing_server(self) -> None:
@@ -1976,8 +1995,12 @@ class MainWindow:
                     **run_kwargs,
                 )
                 if out.returncode == 0:
-                    first = out.stdout.strip().splitlines()[0]
-                    parts = [p.strip() for p in first.split(",")]
+                    # nvidia-smi can exit 0 with empty output (driver restart,
+                    # WDDM hiccup).  Indexing [0] would raise IndexError into the
+                    # bare except below and silently lose the reading.
+                    lines = out.stdout.strip().splitlines()
+                    first = lines[0] if lines else ""
+                    parts = [p.strip() for p in first.split(",")] if first else []
                     if len(parts) == 2 and parts[0] and parts[1]:
                         vram_used = float(parts[0]) / 1024
                         vram_total = float(parts[1]) / 1024
@@ -1993,6 +2016,10 @@ class MainWindow:
         # the table never remains green/"Running" after the server is gone.
         try:
             if self._running_profile_name and not self.proc_mgr.is_running():
+                # Also drop the manager's dead handle: otherwise get_pid() keeps
+                # reporting a stale PID and the next Start is rejected by
+                # start()'s "already running" guard until the GUI is restarted.
+                self.proc_mgr.forget_process()
                 self._running_profile_name = ""
                 self._set_toolbar_running(False)
                 self._refresh_model_table(self.store.list_profiles())
@@ -2831,6 +2858,21 @@ class MainWindow:
         base = self.store.get_ui_state().llama_server_path or ""
         if not base or not os.path.isdir(base):
             return None
+        # The probe shells out to llama-cli and can take seconds; cache the
+        # result per llama.cpp folder so a repeated Start does not block the UI
+        # thread again.  Switching folders naturally misses the cache.
+        cache = getattr(self, "_gpu_probe_cache", None)
+        if cache is None:
+            cache = {}
+            self._gpu_probe_cache = cache
+        if base in cache:
+            return cache[base]
+        result = self._probe_gpu_devices(base)
+        cache[base] = result
+        return result
+
+    def _probe_gpu_devices(self, base: str) -> Optional[bool]:
+        """Blocking ``--list-devices`` probe (see :meth:`_check_gpu_available`)."""
         for exe in ("llama-cli.exe", "llama-cli"):
             candidate = os.path.join(base, exe)
             if os.path.isfile(candidate):
@@ -3391,6 +3433,12 @@ class MainWindow:
             poll_interval = 0.5
             start_time = time.monotonic()
             last_status_update = 0.0
+            # Seeded so the (unlikely) "timeout already elapsed" first pass
+            # cannot fall through to `result.status` with result unbound.
+            result = SmokeTestResult(
+                status=SmokeResult.CONNECTION_ERROR,
+                detail="Server did not become ready in time",
+            )
 
             while True:
                 elapsed = time.monotonic() - start_time
@@ -3422,7 +3470,10 @@ class MainWindow:
                     0,
                     lambda: self._open_browser(profile.server.port),
                 )
-                self._status_bar.set_state("running", f"Server ready (latency: {result.latency_ms}ms)")
+                # Must be marshalled: this runs on the smoke-test thread.
+                self._post_to_ui(
+                    self._status_bar.set_state, "running",
+                    f"Server ready (latency: {result.latency_ms}ms)")
             else:
                 # Failed — update UI on main thread
                 detail = result.detail or "Unknown error"
@@ -3449,8 +3500,25 @@ class MainWindow:
             logger.warning("Failed to open browser: %s", exc)
 
     def _on_stop(self) -> None:
-        """Stop the running server."""
-        self.proc_mgr.stop()
+        """Stop the running server without freezing the UI.
+
+        ``stop()`` waits grace+force seconds for the child to die, which used to
+        block the Tk main loop (window flagged "not responding") for up to ~7 s
+        per click.
+        """
+        self._status_bar.set_state("stopping", "Stopping server...")
+        self._set_toolbar_running(False)
+
+        def worker() -> None:
+            try:
+                self.proc_mgr.stop()
+            finally:
+                self._post_to_ui(self._after_stop)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _after_stop(self) -> None:
+        """Reset the UI once the server has actually stopped (main thread)."""
         self._status_bar.set_state("idle", "Server stopped")
         self._status_bar.set_pid(None)
         self._set_toolbar_running(False)
@@ -3472,10 +3540,38 @@ class MainWindow:
         if not profile:
             return
 
-        success = self.proc_mgr.restart(profile)
-        if success:
-            self._status_bar.set_state("running", f"Restarting on port {profile.server.port}")
+        self._status_bar.set_state("stopping", f"Restarting on port {profile.server.port}...")
+        self._set_toolbar_running(False)
+
+        def worker() -> None:
+            ok = False
+            try:
+                ok = self.proc_mgr.restart(profile)
+            finally:
+                self._post_to_ui(self._after_restart, profile, ok)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _after_restart(self, profile: ModelProfile, ok: bool) -> None:
+        """Reflect the restart outcome in the toolbar either way (main thread).
+
+        A failed restart used to leave the toolbar untouched, so Stop/Open Web
+        stayed enabled for a server that no longer existed.
+        """
+        if ok:
+            self._active_port = profile.server.port
+            self._running_profile_name = profile.profile_name
+            self._status_bar.set_state(
+                "running", f"Restarting on port {profile.server.port}")
+            self._status_bar.set_port(profile.server.port)
+            self._status_bar.set_pid(self.proc_mgr.get_pid())
             self._set_toolbar_running(True)
+        else:
+            self._running_profile_name = ""
+            self._status_bar.set_state("error", "Restart failed")
+            self._status_bar.set_pid(None)
+            self._set_toolbar_running(False)
+        self._refresh_model_table(self.store.list_profiles())
 
     def _on_smoke_test(self) -> None:
         """Run smoke test against the active server.
@@ -3498,24 +3594,47 @@ class MainWindow:
             self._test_panel.append_line(
                 "WARNING: no running llama-server detected - auto-starting the "
                 "selected model first...")
-            if not self._do_start_profile(profile):
-                self._test_panel.append_line("[FAIL] model failed to start, Smoke Test aborted")
-                return
-        elif not same_model:
-            # A different model is still serving — stop it (synchronous, releases
-            # the port) before starting the newly selected model.
+            self._start_then_smoke(profile)
+            return
+        if not same_model:
+            # A different model is still serving — stop it before starting the
+            # newly selected model.  The stop blocks for grace+force seconds, so
+            # it runs off the UI thread and we resume through _post_to_ui.
             self._test_panel.append_line(
                 f"WARNING: {self._running_profile_name} is currently running, "
                 f"which differs from the selected {name} - stopping the old "
                 f"service before starting the selected model...")
-            self._on_stop()
-            if not self._do_start_profile(profile):
-                self._test_panel.append_line("[FAIL] model failed to start, Smoke Test aborted")
-                return
-        else:
-            self._test_panel.append_line(
-                f"{name} is already running - running Smoke Test directly...")
 
+            def switch() -> None:
+                try:
+                    self.proc_mgr.stop()
+                finally:
+                    self._post_to_ui(self._start_then_smoke, profile)
+
+            threading.Thread(target=switch, daemon=True).start()
+            return
+
+        self._test_panel.append_line(
+            f"{name} is already running - running Smoke Test directly...")
+        self._run_smoke_test(profile)
+
+    def _start_then_smoke(self, profile: ModelProfile) -> None:
+        """Launch *profile*, then run the smoke test once it is up.
+
+        Always called on the Tk main thread (directly, or through _post_to_ui
+        after an off-thread stop) because _do_start_profile touches widgets.
+        """
+        if not self._do_start_profile(profile):
+            self._test_panel.append_line(
+                "[FAIL] model failed to start, Smoke Test aborted")
+            return
+        self._run_smoke_test(profile)
+
+    def _run_smoke_test(self, profile: ModelProfile) -> None:
+        """Health-check and speed-test the running server (spawns a thread)."""
+        from llamacpp_loader.smoke_test.runner import SmokeTestRunner, SmokeResult
+
+        name = profile.profile_name
         port = profile.server.port
         self._test_panel.append_line(f"--- Smoke test on port {port} ---")
 
@@ -3670,8 +3789,10 @@ class MainWindow:
                 # Persist the measured speed back to the profile so the Speed
                 # column shows a real value after a passed smoke test.
                 speed_val = _extract_speed(speed_msg)
-                if speed_val is not None and self._selected_profile_name:
-                    self.store.update(self._selected_profile_name, {"speed": speed_val})
+                if speed_val is not None and name:
+                    # Attribute the measurement to the profile we actually
+                    # tested: the user may have selected another row meanwhile.
+                    self.store.update(name, {"speed": speed_val})
                     self.root.after(
                         0, lambda: self._refresh_model_table(self.store.list_profiles()))
 

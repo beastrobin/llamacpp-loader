@@ -128,6 +128,7 @@ class SmokeTestRunner:
         Catches connection errors and converts them to CONNECTION_ERROR results.
         """
         start = time.monotonic()
+        sock: Optional[socket.socket] = None
 
         try:
             # Create raw TCP socket (no external dependencies)
@@ -208,6 +209,15 @@ class SmokeTestRunner:
                 latency_ms=elapsed,
                 detail="Connection refused or network error",
             )
+        finally:
+            # Release the fd on *every* path: connect/sendall/recv raise before
+            # the explicit close runs, and each leak costs a handle per poll
+            # iteration inside wait_until_ready().
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
 
 
 # --------------------------------------------------------------------------- health checker
@@ -224,6 +234,7 @@ class ServerHealthChecker:
 
     def check(self, host: str = "127.0.0.1", port: int = 8080) -> tuple[bool, str]:
         """Single health check. Returns (is_ok: bool, detail: str)."""
+        sock: Optional[socket.socket] = None
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(3.0)
@@ -253,6 +264,13 @@ class ServerHealthChecker:
             return (False, "Connection timed out")
         except (socket.error, OSError) as exc:
             return (False, str(exc))
+        finally:
+            # Same as _check_endpoint: never leak the socket on an error path.
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
 
 
 # --------------------------------------------------------------------------- CLI helper

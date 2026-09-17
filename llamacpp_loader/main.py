@@ -30,7 +30,12 @@ def _setup_logging() -> None:
     )
 
 
-_setup_logging()
+try:
+    _setup_logging()
+except OSError:
+    # %APPDATA% not writable: fall back to stderr-only logging instead of dying
+    # during import, which would look exactly like "the app does not start".
+    logging.basicConfig(level=logging.INFO)
 
 
 def _show_fatal(msg: str) -> None:
@@ -54,7 +59,18 @@ def _show_fatal(msg: str) -> None:
 def main() -> None:
     import tkinter as tk
     from tkinter import messagebox
-    from llamacpp_loader.gui.app import MainWindow
+
+    try:
+        from llamacpp_loader.gui.app import MainWindow
+    except Exception as exc:  # noqa: BLE001 — any import failure must be visible
+        # A broken install (missing stdlib module, syntax error in the package)
+        # has to surface as a dialog: the console-script entry point
+        # (llamacpp_loader.main:main in pyproject.toml) has no __main__ net.
+        logging.exception("Failed to import the GUI")
+        _show_fatal(
+            f"Could not load the loader GUI:\n{exc}\n\n"
+            "(See %APPDATA%\\llamacpp-loader\\app.log for the full traceback)")
+        return
 
     try:
         root = tk.Tk()

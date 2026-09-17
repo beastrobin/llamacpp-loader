@@ -142,6 +142,10 @@ class SamplingParams:
     def set_presence_penalty(self, val):
         object.__setattr__(self, "presence_penalty", _clamp(val, -2.0, 2.0))
 
+    def _revalidate(self) -> None:
+        """Re-apply the constructor's clamping after an external setattr."""
+        self.__post_init__()
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
@@ -192,6 +196,10 @@ class InferenceParams:
     def set_n_predict(self, val):
         object.__setattr__(self, "n_predict", max(0, int(val)))
 
+    def _revalidate(self) -> None:
+        """Re-apply the constructor's clamping after an external setattr."""
+        self.__post_init__()
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
@@ -212,11 +220,33 @@ class ServerParams:
                                  # ("auto" enables it when the GPU/driver supports it)
 
     def __post_init__(self):
-        object.__setattr__(self, "port", max(1, min(self.port, 65535)))
+        try:
+            port = int(self.port)
+        except (TypeError, ValueError):
+            port = 8080
+        object.__setattr__(self, "port", max(1, min(port, 65535)))
+        host = str(self.host or "").strip()
+        object.__setattr__(self, "host", host or "127.0.0.1")
+        attn = str(self.flash_attn or "auto").strip().lower()
+        object.__setattr__(
+            self, "flash_attn", attn if attn in ("auto", "on", "off") else "auto")
 
-    # --- validation helper for runtime mutation ---
+    # --- validation helpers for runtime mutation ---
     def set_port(self, val):
         object.__setattr__(self, "port", max(1, min(int(val), 65535)))
+
+    def set_host(self, val):
+        host = str(val or "").strip()
+        object.__setattr__(self, "host", host or "127.0.0.1")
+
+    def set_flash_attn(self, val):
+        attn = str(val or "auto").strip().lower()
+        object.__setattr__(
+            self, "flash_attn", attn if attn in ("auto", "on", "off") else "auto")
+
+    def _revalidate(self) -> None:
+        """Re-apply the constructor's validation after an external setattr."""
+        self.__post_init__()
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -511,6 +541,32 @@ class UiState:
     console_sash_ratio: float = 0.67 # server output/test results split
     table_column_widths: dict[str, int] = field(default_factory=dict)
 
+    def __post_init__(self):
+        """Clamp layout values so a hand-edited config cannot break layout."""
+        for attr, default, floor in (
+            ("window_width", 960, 480),
+            ("window_height", 680, 360),
+        ):
+            try:
+                val = int(getattr(self, attr))
+            except (TypeError, ValueError):
+                val = default
+            object.__setattr__(self, attr, max(floor, val))
+
+        for attr, default in (
+            ("upper_sash_ratio", 0.50),
+            ("content_sash_ratio", 0.68),
+            ("console_sash_ratio", 0.67),
+        ):
+            try:
+                val = float(getattr(self, attr))
+            except (TypeError, ValueError):
+                val = default
+            object.__setattr__(self, attr, min(0.9, max(0.1, val)))
+
+        if not isinstance(self.table_column_widths, dict):
+            object.__setattr__(self, "table_column_widths", {})
+
 
 # --------------------------------------------------------------------------- config store
 
@@ -626,7 +682,10 @@ class ConfigStore:
         """Load settings from disk.  Creates defaults if file doesn't exist."""
         if not self._path.exists():
             # First run - write out default structure
-            self.save()
+            try:
+                self.save()
+            except OSError as exc:
+                logger.warning("Could not create initial config %s: %s", self._path, exc)
             return
 
         try:
@@ -639,27 +698,41 @@ class ConfigStore:
             if text.startswith("\ufeff"):
                 text = text[1:]
             raw = json.loads(text)
-        except (json.JSONDecodeError, OSError) as exc:
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
             logger.warning("Failed to load config %s: %s", self._path, exc)
             # Recoverable - keep in-memory defaults and overwrite on next save.
             return
 
-        meta = raw.get("_meta", {})
-        version = meta.get("version")
-        if version is not None and version != self.CURRENT_VERSION:
+        if not isinstance(raw, dict):
+            # Valid JSON that is not an object (null / [] / 42).  Indexing it
+            # raised AttributeError straight out of ConfigStore.__init__, taking
+            # the whole GUI down before it could show anything at all.
             logger.warning(
-                "Config version %d mismatch (current=%d), migrating.", version,
-                self.CURRENT_VERSION,
-            )
+                "Config %s is not a JSON object (%s); ignoring it.",
+                self._path, type(raw).__name__)
+            return
+
+        meta = raw.get("_meta") if isinstance(raw.get("_meta"), dict) else {}
+        self._migrate(meta.get("version"))
 
         # Load defaults
         defs_data = raw.get("defaults", {})
-        if defs_data:
-            self._defaults = ModelProfile.from_dict(defs_data)
+        if isinstance(defs_data, dict) and defs_data:
+            try:
+                self._defaults = ModelProfile.from_dict(defs_data)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Ignoring corrupt defaults section: %s", exc)
 
         # Load profiles
         profiles_raw = raw.get("profiles", {})
+        if not isinstance(profiles_raw, dict):
+            logger.warning(
+                "Ignoring non-object 'profiles' section in %s.", self._path)
+            profiles_raw = {}
         for name, pdata in profiles_raw.items():
+            if not isinstance(pdata, dict):
+                logger.warning("Skipping profile %s: not a JSON object", name)
+                continue
             try:
                 self._profiles[name] = ModelProfile.from_dict(pdata)
             except Exception as exc:  # noqa: BLE001
@@ -667,9 +740,15 @@ class ConfigStore:
 
         # Load UI state
         ui_data = raw.get("ui_state")
-        if ui_data:
+        if isinstance(ui_data, dict):
             valid_keys = UiState.__dataclass_fields__
-            self._ui_state = UiState(**{k: v for k, v in ui_data.items() if k in valid_keys})
+            try:
+                self._ui_state = UiState(
+                    **{k: v for k, v in ui_data.items() if k in valid_keys})
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Ignoring invalid ui_state section: %s", exc)
+        elif ui_data is not None:
+            logger.warning("Ignoring non-object ui_state section in %s.", self._path)
 
         # Load external agents (generic launcher targets).  Disk is authoritative;
         # if the key is missing or not a list, default to an empty list (no
@@ -686,14 +765,41 @@ class ConfigStore:
         for pdata in profiles_raw.values():
             if isinstance(pdata, dict) and "dflash" in str(pdata.get("mtp_model", "")).lower() \
                     and not str(pdata.get("dflash_model", "")).strip():
-                self.save()
+                self._save_best_effort("legacy draft-model migration")
                 break
+
+    def _migrate(self, version: Any) -> None:
+        """Bring an older on-disk schema forward.
+
+        Only version 1 ships today, so this mainly validates.  It exists so a
+        future bump has an obvious place to add the upgrade: the previous
+        implementation logged "migrating" and then did nothing at all, and
+        ``"%d" % version`` raised inside logging when the field was a string.
+        """
+        if version is None:
+            return
+        try:
+            found = int(version)
+        except (TypeError, ValueError):
+            logger.warning("Config has a non-numeric version %r; ignoring it.", version)
+            return
+        if found > self.CURRENT_VERSION:
+            logger.warning(
+                "Config version %d is newer than this build understands (%d); "
+                "loading it anyway.", found, self.CURRENT_VERSION)
+        elif found < self.CURRENT_VERSION:
+            logger.info(
+                "Migrating config from version %d to %d.", found, self.CURRENT_VERSION)
 
     def save(self) -> None:
         """Persist current state to disk (thread-safe).
 
         The snapshot AND the atomic temp-file write both run inside the lock so
         concurrent saves serialize and can never clobber each other's data.
+
+        Raises:
+            OSError: the config could not be written.  Callers must not report
+                success when the data never reached the disk.
         """
         with self._lock:
             data = {
@@ -703,18 +809,44 @@ class ConfigStore:
                 "ui_state": asdict(self._ui_state),
                 "agents": self._agents,
             }
-            # Atomic write via temp file + rename (kept inside the lock so
-            # concurrent saves serialize and never clobber each other).
-            tmp_path = self._path.with_suffix(".tmp")
+            # Atomic write via a *unique* temp file + rename, flushed to disk
+            # before the swap.  A fixed "settings.tmp" name let two processes
+            # (two GUIs, or the GUI plus scripts/register_all_models.py) write
+            # and rename the same file concurrently; without fsync a power loss
+            # could leave a truncated config behind.
+            tmp_path = self._path.with_name(
+                f"{self._path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
             try:
                 self._path.parent.mkdir(parents=True, exist_ok=True)
-                tmp_path.write_text(
-                    json.dumps(data, indent=2, ensure_ascii=False),
-                    encoding="utf-8",
-                )
+                with open(tmp_path, "w", encoding="utf-8") as fh:
+                    json.dump(data, fh, indent=2, ensure_ascii=False)
+                    fh.flush()
+                    os.fsync(fh.fileno())
                 os.replace(str(tmp_path), str(self._path))
-            except OSError as exc:
-                logger.error("Failed to save config %s: %s", self._path, exc)
+            except OSError:
+                # Drop the partial temp file, then let the caller know the data
+                # did not persist.  Swallowing this used to make add/update
+                # report success while settings.json never changed, so saved
+                # models "vanished" on the next launch.
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+
+    def _save_best_effort(self, what: str) -> bool:
+        """Persist, downgrading a write failure to a log line + False.
+
+        Used by paths where refusing to continue would be worse than losing the
+        write (cosmetic UI state, a legacy migration done while loading).
+        Callers that promised the user a save use save() directly.
+        """
+        try:
+            self.save()
+        except OSError as exc:
+            logger.error("Could not persist %s: %s", what, exc)
+            return False
+        return True
 
     def reload(self) -> None:
         """Force-reload from disk (useful after external edits)."""
@@ -738,7 +870,7 @@ class ConfigStore:
         """Replace the global default template and persist."""
         with self._lock:
             self._defaults = value
-        self.save()
+        self._save_best_effort("global defaults")
 
     def apply_defaults_to(self, profile: ModelProfile) -> ModelProfile:
         """Create a new profile that starts from global defaults, then applies *profile*'s non-default fields.
@@ -816,15 +948,18 @@ class ConfigStore:
                     base_name = f"{prefix}-{base_name}"
             # display_name: readable form
             display_name = base_name.replace("-", " ").title()
-            # model_path is the parent directory of the .gguf file
+            # model_path is the parent directory of the .gguf file and
+            # gguf_file is the bare filename: every consumer resolves a model as
+            # os.path.join(model_path, gguf_file).  Storing the path *relative
+            # to the scan root* here (as this did) duplicated the intermediate
+            # directories on join, pointing at a file that does not exist for
+            # any model that lives in a subdirectory.
             model_path = str(gguf_file.parent)
-            gguf_file_rel = relative.as_posix()
-
             profile = ModelProfile(
                 profile_name=base_name,
                 display_name=display_name,
                 model_path=model_path,
-                gguf_file=gguf_file_rel,
+                gguf_file=gguf_file.name,
             )
             # --- autonomous capability detection (best effort) ---
             _enrich_profile_from_gguf(profile, gguf_file, drafts)
@@ -844,8 +979,7 @@ class ConfigStore:
             raise ValueError("profile_name is required")
         with self._lock:
             self._profiles[profile.profile_name] = profile
-        self.save()
-        return True
+        return self._save_best_effort(f"profile {profile.profile_name!r}")
 
     def update(self, name: str, updates: dict[str, Any]) -> bool:
         """Update a single field on an existing profile.
@@ -853,6 +987,9 @@ class ConfigStore:
         ``updates`` is a flat dict keyed by top-level attribute names
         (``"display_name"``, ``"model_path"``, etc.).  Nested keys use dot
         notation (e.g. ``"inference.ctx_size"``).  Persisted immediately.
+
+        Returns False when the profile does not exist *or* the update could not
+        be written to disk.
         """
         with self._lock:
             if name not in self._profiles:
@@ -861,12 +998,25 @@ class ConfigStore:
             for key, val in updates.items():
                 if "." in key:
                     attr, subkey = key.split(".", 1)
-                    inner = getattr(profile, attr)
-                    setattr(inner, subkey, val)
+                    inner = getattr(profile, attr, None)
+                    if inner is None:
+                        logger.warning(
+                            "update(%s): unknown section %r, skipping", name, attr)
+                        continue
+                    # Prefer the validating setter: a bare setattr bypassed every
+                    # clamp (ctx_size=-1, port=0, top_k=0, ...) and wrote the bad
+                    # value straight through to llama-server's command line.
+                    setter = getattr(inner, f"set_{subkey}", None)
+                    if callable(setter):
+                        setter(val)
+                    else:
+                        setattr(inner, subkey, val)
+                    revalidate = getattr(inner, "_revalidate", None)
+                    if callable(revalidate):
+                        revalidate()
                 else:
                     setattr(profile, key, val)
-        self.save()
-        return True
+        return self._save_best_effort(f"update of {name!r}")
 
     def delete(self, name: str) -> bool:
         """Delete a profile by name. Returns True if it existed."""
@@ -874,8 +1024,7 @@ class ConfigStore:
             if name not in self._profiles:
                 return False
             del self._profiles[name]
-        self.save()
-        return True
+        return self._save_best_effort(f"deletion of {name!r}")
 
     # ------------------------------------------------------------------ agents
     def get_agents(self) -> list[dict]:
@@ -906,7 +1055,7 @@ class ConfigStore:
         """
         with self._lock:
             self._agents = list(agents)
-        self.save()
+        self._save_best_effort("agent list")
 
     def load(self, name: str) -> Optional[ModelProfile]:
         """Retrieve a profile by name. Returns None if not found."""
@@ -946,19 +1095,23 @@ class ConfigStore:
             return UiState(**asdict(self._ui_state))
 
     def set_ui_state(self, **kwargs: Any) -> None:
-        """Update one or more UI state fields and persist."""
+        """Update one or more UI state fields and persist.
+
+        Best-effort: window geometry and sort order are cosmetic, so a write
+        failure must not break the interaction that triggered it.
+        """
         with self._lock:
             for key, val in kwargs.items():
                 if hasattr(self._ui_state, key):
                     setattr(self._ui_state, key, val)
-        self.save()
+        self._save_best_effort("UI state")
 
     # ------------------------------------------------------------------ context manager
     def __enter__(self) -> ConfigStore:
         return self
 
     def __exit__(self, *args: Any) -> None:
-        self.save()
+        self._save_best_effort("config on context exit")
 
 
 # --------------------------------------------------------------------------- CLI helper

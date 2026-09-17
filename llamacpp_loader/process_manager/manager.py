@@ -10,6 +10,7 @@ import ctypes
 import functools
 import ipaddress
 import json
+import locale
 import logging
 import os
 import platform
@@ -204,6 +205,25 @@ def _normalize_loopback_host(host: str) -> str:
     return str(address)
 
 
+def _decode_output_line(raw: bytes) -> str:
+    """Decode one line of llama-server output.
+
+    llama.cpp writes UTF-8, but Windows builds can emit the local code page
+    (GBK on zh-CN) instead — decoding those bytes as UTF-8 with replacement
+    characters turned the log pane into garbage.  Try strict UTF-8 first, then
+    fall back to the platform encoding.
+    """
+    try:
+        return raw.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        pass
+    try:
+        fallback = locale.getpreferredencoding(False) or "utf-8"
+    except Exception:  # noqa: BLE001 — a locale lookup must never break logging
+        fallback = "utf-8"
+    return raw.decode(fallback, errors="replace").strip()
+
+
 # --------------------------------------------------------------------------- process manager
 
 
@@ -235,6 +255,9 @@ class ProcessManager:
         self._state = ProcessState.IDLE
         self._output_thread: Optional[threading.Thread] = None
         self._watcher_thread: Optional[threading.Thread] = None
+        #: Consecutive auto-restart attempts since the last healthy start.
+        self._restart_attempts = 0
+        self._auto_restart = True
         # Last resolved llama-server path, used only for registry metadata.
         self._config_store = config_store
         self._cached_server_path: Optional[str] = None
@@ -363,7 +386,11 @@ class ProcessManager:
             target=self._read_output_loop, daemon=True)
         self._output_thread.start()
 
-        # Start crash-restart watcher
+        # Start the crash-restart watcher.  Retire any watcher left over from a
+        # previous run first: it would keep polling alongside the new one,
+        # leaking a thread per restart and racing the crash handling.
+        self._stop_watcher()
+        self._restart_attempts = 0
         self._watcher_thread = ProcessWatcher(self, poll_interval=1.0)
         self._watcher_thread.start()
 
@@ -405,6 +432,10 @@ class ProcessManager:
         """
         self._set_state(ProcessState.STOPPING)
         self._forward_log("Stopping server...")
+
+        # Retire the crash watcher *before* touching the process: otherwise it
+        # can observe the exit we are about to cause and auto-restart it.
+        self._stop_watcher()
 
         with self._lock:
             proc = self._process
@@ -448,6 +479,11 @@ class ProcessManager:
             # Drop the on-disk registry entry once we have acted on the server,
             # so a future session does not try to adopt a server we've stopped.
             clear_registry()
+            # Release the dead handle and its stdout pipe.  Without this,
+            # get_pid() keeps reporting a stale PID (defeating the GUI's
+            # "server is already dead" fast path) and every restart leaks a
+            # pipe handle.
+            self._close_process()
 
     def _adopt_from_registry(self) -> Optional["_PidHandle"]:
         """Reconnect to a server tracked in the on-disk registry.
@@ -460,12 +496,13 @@ class ProcessManager:
         if data is None:
             return None
         pid = data.get("pid")
-        if pid is None or not _pid_is_llama_server(pid):
+        started_at = data.get("started_at")
+        if pid is None or not _pid_is_llama_server(pid, started_after=started_at):
             clear_registry()
             return None
         self._forward_log(
             f"Adopting server from registry (PID {pid}, port {data.get('port')})")
-        return _PidHandle(pid)
+        return _PidHandle(pid, started_at=started_at)
 
     def _adopt_orphan_from_scan(self) -> Optional["_PidHandle"]:
         """Reconnect to a live llama-server found by scanning the system.
@@ -494,11 +531,12 @@ class ProcessManager:
         if data is None:
             return None
         pid = data.get("pid")
-        if pid is None or not _pid_is_llama_server(pid):
+        started_at = data.get("started_at")
+        if pid is None or not _pid_is_llama_server(pid, started_after=started_at):
             clear_registry()
             return None
         with self._lock:
-            self._process = _PidHandle(pid)
+            self._process = _PidHandle(pid, started_at=started_at)
         self._set_state(ProcessState.RUNNING)
         self._forward_log(
             f"Recovered running server from previous session (PID {pid}, "
@@ -556,13 +594,102 @@ class ProcessManager:
                 return False
             return self._process.poll() is None
 
+    def forget_process(self) -> None:
+        """Release a child handle that is no longer alive (idempotent).
+
+        Used when the GUI notices the server disappeared before the crash
+        watcher does.  The RUNNING→ERROR transition and any auto-restart remain
+        the watcher's job, so this deliberately leaves the state untouched.
+        """
+        with self._lock:
+            proc = self._process
+        if proc is not None and proc.poll() is None:
+            return  # still alive — nothing to forget
+        self._close_process()
+
     # ----------------------------------------------------------- internal
     _last_config: Optional[ServerConfig] = None  # type: ignore[misc]
+
+    #: Consecutive auto-restarts to attempt before giving up and staying at
+    #: ERROR.  Bounds a crash loop (e.g. the model file was moved) instead of
+    #: respawning the server once a second forever.
+    MAX_AUTO_RESTARTS = 3
 
     def _set_state(self, state: ProcessState) -> None:
         """Update process state (thread-safe)."""
         with self._lock:
             self._state = state
+
+    def _stop_watcher(self) -> None:
+        """Retire the crash watcher thread (idempotent).
+
+        ``stop_watching()`` previously had no caller at all, so each restart
+        left another watcher polling the same process — every one of them able
+        to fire its own auto-restart.  The reference is detached *before* the
+        join so this stays re-entrant when the watcher itself calls start().
+        """
+        watcher = self._watcher_thread
+        self._watcher_thread = None
+        if watcher is None:
+            return
+        watcher.stop_watching()
+        if watcher is not threading.current_thread():
+            watcher.join(timeout=3.0)
+
+    def _close_process(self) -> None:
+        """Drop the child handle and close its stdout pipe (idempotent)."""
+        with self._lock:
+            proc = self._process
+            self._process = None
+        stream = getattr(proc, "stdout", None) if proc is not None else None
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    def _handle_crash(self, returncode: Optional[int]) -> None:
+        """React to an unexpected child exit (called from the watcher thread).
+
+        The dead handle is cleared and the state moved off RUNNING *before*
+        restarting.  Previously the state stayed RUNNING, so ``start()``'s
+        "already running" guard rejected every attempt: the auto-restart was a
+        no-op that retried once a second forever while the UI still claimed the
+        server was up, and the user had to restart the whole GUI.
+        """
+        with self._lock:
+            if self._state != ProcessState.RUNNING:
+                return
+            config = self._last_config
+            attempts = self._restart_attempts
+        self._close_process()
+        self._set_state(ProcessState.ERROR)
+        clear_registry()
+
+        if returncode == 0:
+            self._forward_log("Server exited normally.")
+            return
+        if not self._auto_restart:
+            self._forward_log(
+                f"Server crashed with exit code {returncode}. "
+                "Auto-restart is disabled.")
+            return
+        if config is None:
+            self._forward_log(
+                f"Server crashed with exit code {returncode}; no config to restart.")
+            return
+        if attempts >= self.MAX_AUTO_RESTARTS:
+            self._forward_log(
+                f"Server crashed with exit code {returncode}. Giving up after "
+                f"{attempts} auto-restart attempts.")
+            return
+
+        self._restart_attempts = attempts + 1
+        self._forward_log(
+            f"Server crashed with exit code {returncode}. Auto-restarting "
+            f"(attempt {attempts + 1}/{self.MAX_AUTO_RESTARTS})...")
+        if not self.start(config):
+            self._forward_log("Auto-restart failed to launch the server.")
 
     def _build_command(self, config: ServerConfig) -> list[str]:
         """Build the CLI command list from ServerConfig.
@@ -785,10 +912,7 @@ class ProcessManager:
 
         try:
             for raw_line in iter(self._process.stdout.readline, b""):
-                try:
-                    line = raw_line.decode("utf-8", errors="replace").strip()
-                except Exception:
-                    continue
+                line = _decode_output_line(raw_line)
                 if not line:
                     continue
                 self._forward_log(line)
@@ -863,10 +987,13 @@ class ProcessWatcher(threading.Thread):
                 returncode = proc.returncode if proc else -1
                 if state == ProcessState.STOPPING:
                     continue  # expected shutdown
-                elif state == ProcessState.RUNNING and returncode != 0:
-                    self._manager._forward_log(
-                        f"Server crashed with exit code {returncode}. Auto-restarting...")
-                    self._manager.start(self._manager._last_config)  # type: ignore[arg-type]
+                if state == ProcessState.RUNNING:
+                    # Hand off to the manager, which clears the dead handle and
+                    # restarts.  Either way this watcher is finished: start()
+                    # spins up a fresh one, and looping on here would duplicate
+                    # the crash handling.
+                    self._manager._handle_crash(returncode)
+                return
 
     def stop_watching(self) -> None:
         """Signal the watcher thread to exit."""
@@ -970,8 +1097,26 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _kill_pid(pid: int) -> None:
-    """Terminate the process with *pid* (best-effort, cross-platform)."""
+    """Terminate the process with *pid* (best-effort, cross-platform).
+
+    On Windows this walks the child tree with ``taskkill /T``: TerminateProcess
+    only kills the process itself, so a wedged server that spawned helpers would
+    leave orphans holding the port and the VRAM.
+    """
     if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+                check=False,
+                # CREATE_NO_WINDOW: keep taskkill from flashing a console window
+                creationflags=0x08000000,
+            )
+            return
+        except (OSError, subprocess.SubprocessError):
+            pass  # fall through to the raw API call below
         try:
             kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
         except AttributeError:
@@ -1014,14 +1159,22 @@ def _pid_image_name(pid: int) -> Optional[str]:
             return None
 
 
-def _pid_is_llama_server(pid: int) -> bool:
+def _pid_is_llama_server(pid: int, *, started_after: Optional[float] = None) -> bool:
     """True if *pid* is alive AND its image name looks like llama-server.
 
     Guards against PID reuse: a stale registry pointing at a PID that the OS
     has since reassigned to an unrelated process must not be adopted or killed.
+    When *started_after* (a unix timestamp recorded before we launched) is
+    given, a process that predates it is rejected too — that covers a recycled
+    PID that happens to belong to *another* llama-server.
     """
     if not _pid_alive(pid):
         return False
+    if started_after is not None:
+        created = _pid_create_time(pid)
+        # 5 s of slack absorbs clock granularity between the two readings.
+        if created is not None and created < started_after - 5.0:
+            return False
     name = _pid_image_name(pid)
     if not name:
         # Image could not be resolved (e.g. access denied) — trust the PID
@@ -1029,6 +1182,38 @@ def _pid_is_llama_server(pid: int) -> bool:
         return True
     base = os.path.basename(name).lower()
     return "llama-server" in base or "llama_server" in base
+
+
+def _pid_create_time(pid: int) -> Optional[float]:
+    """Process creation time as a unix timestamp, or ``None`` if unknown."""
+    if os.name != "nt":
+        return None  # /proc exposes no portable creation time; skip the check
+    try:
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    except AttributeError:
+        return None
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+    try:
+        creation = ctypes.c_ulonglong(0)
+        exit_time = ctypes.c_ulonglong(0)
+        kernel_time = ctypes.c_ulonglong(0)
+        user_time = ctypes.c_ulonglong(0)
+        ok = kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(creation),
+            ctypes.byref(exit_time),
+            ctypes.byref(kernel_time),
+            ctypes.byref(user_time),
+        )
+        if not ok:
+            return None
+        # FILETIME counts 100-ns ticks since 1601-01-01 UTC.
+        return creation.value / 1e7 - 11644473600.0
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def scan_llama_server_pids() -> list[int]:
@@ -1086,29 +1271,37 @@ class _PidHandle:
     stop()/is_running()/get_pid() is implemented.
     """
 
-    def __init__(self, pid: int):
+    def __init__(self, pid: int, *, started_at: Optional[float] = None):
         self.pid = pid
         self.stdout = None  # no pipe to read from
         self.returncode: Optional[int] = None
+        #: Timestamp recorded when the server was spawned; lets every liveness
+        #: check reject a PID the OS recycled for an unrelated process.
+        self._started_at = started_at
+
+    def _alive(self) -> bool:
+        return _pid_is_llama_server(self.pid, started_after=self._started_at)
 
     def poll(self) -> Optional[int]:
-        return None if _pid_alive(self.pid) else 0
+        return None if self._alive() else 0
 
     def terminate(self) -> None:
-        _kill_pid(self.pid)
+        if self._alive():
+            _kill_pid(self.pid)
 
     def kill(self) -> None:
-        _kill_pid(self.pid)
+        if self._alive():
+            _kill_pid(self.pid)
 
     def wait(self, timeout: Optional[float] = None) -> int:
         if timeout is None:
-            while _pid_alive(self.pid):
+            while self._alive():
                 time.sleep(0.1)
             self.returncode = 0
             return 0
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if not _pid_alive(self.pid):
+            if not self._alive():
                 self.returncode = 0
                 return 0
             time.sleep(0.1)

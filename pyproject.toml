@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llamacpp-loader"
-version = "1.10"
+version = "1.11"
 description = "GUI launcher and manager for llama.cpp inference servers"
 readme = "README.md"
 license = { text = "MIT" }
