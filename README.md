@@ -8,11 +8,17 @@ It folds the whole "pick a model → tune params → launch → test" workflow y
 
 ---
 
-## 🖼️ GUI Preview (V1.10)
+## 🖼️ GUI Preview (V1.11)
 
 ![llamacpp-loader GUI preview](docs/gui_preview.png)
 
-> Current V1.10 preview using fictional model names and paths only. It is intentionally safe to publish and does not contain a user's local configuration.
+**Quick** tab — tri-state `Reasoning` (auto / on / off) and `Max tokens` now live beside the launch params.
+
+![llamacpp-loader generation tab](docs/gui_preview_generation.png)
+
+**Generation** tab — the new **Thinking budget** group: `--reasoning-budget` (token cap for the thinking trace alone), `--reasoning-budget-message` (injected when the budget runs out), and `--reasoning-effort` (template-side hint).
+
+> Previews use fictional model names and paths only. They are intentionally safe to publish and do not contain a user's local configuration.
 
 ---
 
