@@ -26,7 +26,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Callable
 
-from ..config.store import normalize_ngram_type
+from ..config.store import (
+    DEFAULT_REASONING_EFFORT,
+    normalize_ngram_type,
+    normalize_reasoning,
+    normalize_reasoning_effort,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +131,21 @@ class ServerConfig:
     presence_penalty: float = 0.0
     kv_cache: str = "f16"          # f16 / q8_0 / q4_0
     n_predict: int = 0             # per-request max tokens (--n-predict); 0 = server default
-    reasoning: bool = False        # --reasoning on/off
+    reasoning: str = "auto"        # --reasoning: "auto" | "on" | "off".
+                                   # "auto" (llama.cpp's own default) emits NO
+                                   # flag, which also keeps the command line
+                                   # valid on builds that only know on/off.
+    reasoning_budget: Optional[int] = None
+                                   # --reasoning-budget: None = emit no flag
+                                   # (llama.cpp default -1 = unrestricted),
+                                   # -1 unrestricted, 0 = end thinking now,
+                                   # N > 0 = token budget for the thinking trace.
+    reasoning_budget_message: str = ""
+                                   # --reasoning-budget-message; injected before
+                                   # the end-of-thinking tag.  Emitted only
+                                   # together with a budget.
+    reasoning_effort: str = DEFAULT_REASONING_EFFORT
+                                   # --reasoning-effort: "default" emits no flag.
     mmproj: str = ""               # vision projector GGUF path (--mmproj)
     mtp_enabled: bool = False      # use an MTP draft model (speculative decoding)
     mtp_model: str = ""            # draft GGUF path (--spec-draft-model)
@@ -327,7 +346,11 @@ class ProcessManager:
                 presence_penalty=sampling.presence_penalty,
                 kv_cache=config.kv_cache,
                 n_predict=getattr(config.inference, "n_predict", 0),
-                reasoning=config.reasoning,
+                reasoning=normalize_reasoning(getattr(config, "reasoning", "auto")),
+                reasoning_budget=getattr(inference, "reasoning_budget", None),
+                reasoning_budget_message=getattr(inference, "reasoning_budget_message", ""),
+                reasoning_effort=getattr(inference, "reasoning_effort",
+                                         DEFAULT_REASONING_EFFORT),
                 mmproj=mmproj,
                 mtp_enabled=config.mtp_enabled,
                 mtp_model=mtp_model,
@@ -849,7 +872,11 @@ class ProcessManager:
             self._forward_log(
                 f"draft model not found, skipping speculative decoding: {missing}")
 
-        # Reasoning toggle (llama-server >= b4xxx supports --reasoning on/off).
+        # Reasoning mode (llama-server >= b4xxx knows on/off; b11026 also
+        # accepts "auto", which is llama.cpp's own default).
+        #   - AUTO: no flag at all.  Omitting the argument is the safest way to
+        #     ask for "auto": it stays valid on older builds that only know
+        #     on/off, and it is what legacy reasoning=False profiles really did.
         #   - ON: emitted whenever the profile enables thinking.  Safe on every
         #     build that knows the flag (auto-thinking templates need it to be
         #     explicit when a request does not set enable_thinking).
@@ -859,17 +886,36 @@ class ProcessManager:
         #     we gate it behind reasoning_off_allowed() (env override or a
         #     fixed upstream build — see REASONING_OFF_MIN_BUILD).  Until then
         #     we warn once: clients must send enable_thinking=false themselves.
-        if config.reasoning:
+        reasoning_mode = normalize_reasoning(getattr(config, "reasoning", "auto"))
+        if reasoning_mode == "on":
             cmd.extend(["--reasoning", "on"])
-        elif reasoning_off_allowed(exe):
-            cmd.extend(["--reasoning", "off"])
-        elif not getattr(self, "_reasoning_off_warned", False):
-            self._reasoning_off_warned = True
-            self._forward_log(
-                "reasoning is off in the profile, but this llama.cpp build "
-                "cannot safely disable it server-side (b10588-era builds crash "
-                "on --reasoning off). Clients talking to this server must send "
-                "enable_thinking=false per request for thinking-template models.")
+        elif reasoning_mode == "off":
+            if reasoning_off_allowed(exe):
+                cmd.extend(["--reasoning", "off"])
+            elif not getattr(self, "_reasoning_off_warned", False):
+                self._reasoning_off_warned = True
+                self._forward_log(
+                    "reasoning is off in the profile, but this llama.cpp build "
+                    "cannot safely disable it server-side (b10588-era builds crash "
+                    "on --reasoning off). Clients talking to this server must send "
+                    "enable_thinking=false per request for thinking-template models.")
+
+        # Thinking budget.  Capping only the thinking trace (rather than the
+        # whole generation via --n-predict) leaves room for the answer, which is
+        # exactly what long chain-of-thought models need.  Both flags stay
+        # omitted unless the profile sets a value: llama.cpp exits on arguments
+        # it does not recognise, so a build predating these flags would fail to
+        # start if we always emitted them.
+        budget = getattr(config, "reasoning_budget", None)
+        if budget is not None:
+            cmd.extend(["--reasoning-budget", str(budget)])
+            message = str(getattr(config, "reasoning_budget_message", "") or "").strip()
+            if message:
+                cmd.extend(["--reasoning-budget-message", message])
+        effort = normalize_reasoning_effort(
+            getattr(config, "reasoning_effort", DEFAULT_REASONING_EFFORT))
+        if effort != DEFAULT_REASONING_EFFORT:
+            cmd.extend(["--reasoning-effort", effort])
 
         # Flash Attention — "auto" lets llama-server enable it when the GPU /
         # driver supports it ("on" forces it, "off" disables).  Always emitted

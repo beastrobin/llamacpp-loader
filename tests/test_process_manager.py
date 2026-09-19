@@ -335,16 +335,32 @@ class TestReasoningOffGuard:
 
     def test_reasoning_on_is_always_emitted(self):
         cmd = ProcessManager(log_callback=None)._build_command(
-            ServerConfig(model_path="/m.gguf", port=9001, reasoning=True))
+            ServerConfig(model_path="/m.gguf", port=9001, reasoning="on"))
         i = cmd.index("--reasoning")
         assert cmd[i + 1] == "on"
 
+    def test_reasoning_auto_emits_no_flag(self):
+        """auto is llama.cpp's own default, so the argument stays off."""
+        cmd = ProcessManager(log_callback=None)._build_command(
+            ServerConfig(model_path="/m.gguf", port=9001))
+        assert "--reasoning" not in cmd
+
+    def test_legacy_bool_reasoning_still_maps(self):
+        """Configs written before the tri-state change stored a bool."""
+        on = ProcessManager(log_callback=None)._build_command(
+            ServerConfig(model_path="/m.gguf", port=9001, reasoning=True))
+        assert on[on.index("--reasoning") + 1] == "on"
+        auto = ProcessManager(log_callback=None)._build_command(
+            ServerConfig(model_path="/m.gguf", port=9001, reasoning=False))
+        assert "--reasoning" not in auto
+
     def test_reasoning_off_omitted_without_env_or_fixed_build(self):
-        """Default path: no flag at all + a guidance warning (not a crash)."""
+        """Buggy build: no flag at all + a guidance warning (not a crash)."""
         from llamacpp_loader.process_manager import manager
         lines = []
         mgr = ProcessManager(log_callback=lines.append)
-        cmd = mgr._build_command(ServerConfig(model_path="/m.gguf", port=9001))
+        cmd = mgr._build_command(
+            ServerConfig(model_path="/m.gguf", port=9001, reasoning="off"))
         assert "--reasoning" not in cmd
         assert any("enable_thinking=false" in ln for ln in lines)
         # Clean up the once-per-instance warning latch for other tests.
@@ -353,7 +369,7 @@ class TestReasoningOffGuard:
     def test_reasoning_off_emitted_when_env_override_set(self, monkeypatch):
         monkeypatch.setenv("LLAMACPP_REASONING_OFF", "1")
         cmd = ProcessManager(log_callback=None)._build_command(
-            ServerConfig(model_path="/m.gguf", port=9001))
+            ServerConfig(model_path="/m.gguf", port=9001, reasoning="off"))
         assert cmd[cmd.index("--reasoning") + 1] == "off"
 
     def test_reasoning_off_allowed_gates_on_fixed_build(self, monkeypatch):
@@ -386,3 +402,68 @@ class TestNPredictEmission:
         cmd = ProcessManager(log_callback=None)._build_command(
             ServerConfig(model_path="/m.gguf", port=9001))
         assert "--n-predict" not in cmd
+
+
+class TestReasoningBudget:
+    """--reasoning-budget caps the thinking trace on its own.
+
+    Every flag here is opt-in: llama.cpp exits on arguments it does not know,
+    so an unset box must produce no argument at all.
+    """
+
+    def test_all_flags_omitted_when_unset(self):
+        cmd = ProcessManager(log_callback=None)._build_command(
+            ServerConfig(model_path="/m.gguf", port=9001, reasoning="on"))
+        assert "--reasoning-budget" not in cmd
+        assert "--reasoning-budget-message" not in cmd
+        assert "--reasoning-effort" not in cmd
+
+    def test_budget_emitted_when_set(self):
+        cmd = ProcessManager(log_callback=None)._build_command(
+            ServerConfig(model_path="/m.gguf", port=9001, reasoning="on",
+                         reasoning_budget=4096))
+        assert cmd[cmd.index("--reasoning-budget") + 1] == "4096"
+
+    def test_zero_budget_is_emitted(self):
+        """0 means "end thinking immediately" — a real value, not "unset"."""
+        cmd = ProcessManager(log_callback=None)._build_command(
+            ServerConfig(model_path="/m.gguf", port=9001, reasoning="on",
+                         reasoning_budget=0))
+        assert cmd[cmd.index("--reasoning-budget") + 1] == "0"
+
+    def test_negative_one_budget_is_emitted(self):
+        cmd = ProcessManager(log_callback=None)._build_command(
+            ServerConfig(model_path="/m.gguf", port=9001, reasoning="on",
+                         reasoning_budget=-1))
+        assert cmd[cmd.index("--reasoning-budget") + 1] == "-1"
+
+    def test_message_requires_a_budget(self):
+        cmd = ProcessManager(log_callback=None)._build_command(
+            ServerConfig(model_path="/m.gguf", port=9001, reasoning="on",
+                         reasoning_budget_message="wrap up"))
+        assert "--reasoning-budget-message" not in cmd
+
+    def test_message_emitted_with_budget(self):
+        cmd = ProcessManager(log_callback=None)._build_command(
+            ServerConfig(model_path="/m.gguf", port=9001, reasoning="on",
+                         reasoning_budget=2048,
+                         reasoning_budget_message="wrap up"))
+        assert cmd[cmd.index("--reasoning-budget-message") + 1] == "wrap up"
+
+    def test_effort_default_emits_nothing(self):
+        cmd = ProcessManager(log_callback=None)._build_command(
+            ServerConfig(model_path="/m.gguf", port=9001, reasoning="on",
+                         reasoning_effort="default"))
+        assert "--reasoning-effort" not in cmd
+
+    def test_effort_emitted_when_set(self):
+        cmd = ProcessManager(log_callback=None)._build_command(
+            ServerConfig(model_path="/m.gguf", port=9001, reasoning="on",
+                         reasoning_effort="high"))
+        assert cmd[cmd.index("--reasoning-effort") + 1] == "high"
+
+    def test_invalid_effort_falls_back_to_default(self):
+        cmd = ProcessManager(log_callback=None)._build_command(
+            ServerConfig(model_path="/m.gguf", port=9001, reasoning="on",
+                         reasoning_effort="banana"))
+        assert "--reasoning-effort" not in cmd

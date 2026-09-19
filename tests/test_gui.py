@@ -214,7 +214,10 @@ class TestModelDetailPanel:
             profile_name="demo", display_name="Demo",
             model_path=str(tmp_path), gguf_file=model.name,
             kv_cache="q8_0",
-            inference=InferenceParams(ctx_size=32768, n_predict=12000)))
+            reasoning="on",
+            inference=InferenceParams(ctx_size=32768, n_predict=12000,
+                                      reasoning_budget=4096,
+                                      reasoning_effort="high")))
 
         assert panel._vars["ctx"].get() == "32"
         assert panel._vars["kv"].get() == "Q8"
@@ -232,15 +235,19 @@ class TestModelDetailPanel:
         assert panel._pages["Generation"].grid_columnconfigure(0)["weight"] == 0
         # CPU-MoE sits immediately below GPU layers and shares its columns.
         assert {child.grid_info()["row"] for child in panel._quick_columns[0].grid_slaves()} == {0, 1, 2, 3, 4}
-        assert {child.grid_info()["row"] for child in panel._quick_columns[1].grid_slaves()} == {0, 1, 2, 3}
+        # Max tokens moved onto Quick, so its right column gained a fifth row.
+        assert {child.grid_info()["row"] for child in panel._quick_columns[1].grid_slaves()} == {0, 1, 2, 3, 4}
         # Advanced is a four-row form, not four explanatory Configure buttons.
         assert set(panel._capability_status) == {
             "vision_status", "mtp_status", "dflash_status", "ngram_status"}
         assert panel._vars["mtp_n_max"].get() == "7"
         assert panel._inputs["mtp_n_max"].cget("from") == 1.0
         assert panel._inputs["mtp_n_max"].cget("to") == 16.0
-        # Max tokens row: maps to inference.n_predict and shows 0 = auto.
+        # Max tokens lives on Quick now; Generation carries the budget trio.
         assert panel._vars["max_tokens"].get() == "12000"
+        assert panel._vars["reasoning"].get() == "on"
+        assert panel._vars["reasoning_budget"].get() == "4096"
+        assert panel._vars["reasoning_effort"].get() == "high"
         assert panel._vars["cpu_moe_mode"].get() == "GPU all"
         assert panel._inputs["cpu_moe_layers"].master is panel._quick_columns[0]
         assert panel._inputs["cpu_moe_mode"].grid_info()["column"] == panel._inputs["gpu"].grid_info()["column"]
@@ -264,6 +271,26 @@ class TestModelDetailPanel:
         assert ("demo", {"mtp_enabled": True}) in changes
         assert ("demo", {"mtp_n_max": 4}) in changes
         assert ("demo", {"cpu_moe": False, "n_cpu_moe": 12}) in changes
+
+        # Reasoning writes a tri-state string, and the budget trio routes into
+        # InferenceParams so it travels with presets.
+        panel._vars["reasoning"].set("off")
+        panel._commit("reasoning")
+        panel._vars["reasoning_budget"].set("2048")
+        panel._commit("reasoning_budget")
+        panel._vars["reasoning_budget_msg"].set("wrap up")
+        panel._commit("reasoning_budget_msg")
+        panel._vars["reasoning_effort"].set("low")
+        panel._commit("reasoning_effort")
+        assert ("demo", {"reasoning": "off"}) in changes
+        assert ("demo", {"inference.reasoning_budget": 2048}) in changes
+        assert ("demo", {"inference.reasoning_budget_message": "wrap up"}) in changes
+        assert ("demo", {"inference.reasoning_effort": "low"}) in changes
+
+        # A cleared budget box means "emit no flag", not 0 (0 = stop thinking).
+        panel._vars["reasoning_budget"].set("")
+        panel._commit("reasoning_budget")
+        assert ("demo", {"inference.reasoning_budget": None}) in changes
 
 
 class TestOnClosing:

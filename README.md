@@ -4,7 +4,7 @@
 
 It folds the whole "pick a model → tune params → launch → test" workflow you used to do with hand-written `.bat` files and sticky notes into a single GUI:
 
-![Python](https://img.shields.io/badge/Python-3.10%2B-blue) ![License](https://img.shields.io/badge/License-MIT-green) ![Tests](https://img.shields.io/badge/tests-90%20passed-brightgreen)
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue) ![License](https://img.shields.io/badge/License-MIT-green) ![Tests](https://img.shields.io/badge/tests-159%20passed-brightgreen)
 
 ---
 
@@ -22,7 +22,8 @@ It folds the whole "pick a model → tune params → launch → test" workflow y
 |---|---|
 | 🎯 **Model management** | Add GGUF models via a file picker; each gets its own auto-generated `ModelProfile` (independent parameters per model) |
 | 🔎 **Auto-discovery** | `scan_models()` recursively scans a directory, detects every `.gguf` and builds a readable config |
-| ⚙️ **Parameter tuning** | Compact Quick (4+4), Generation, and Advanced tabs for launch, sampling, and optional capability settings |
+| ⚙️ **Parameter tuning** | Compact Quick (4+5), Generation, and Advanced tabs for launch, sampling, and optional capability settings |
+| 🧠 **Thinking controls** | Tri-state `--reasoning` (auto/on/off) plus a thinking-only budget (`--reasoning-budget`, `--reasoning-budget-message`, `--reasoning-effort`) so a long chain of thought cannot swallow the answer |
 | 💾 **Parameter persistence** | Model parameters, table widths, splitter positions, and window size are saved between launches |
 | 🚀 **One-click launch** | Select model → Start → auto-spawns llama-server → health check passes → **opens the Web UI automatically** |
 | 🧪 **Smoke test** | `SmokeTestRunner` checks server health + `scripts/smoke_live.py` measures real throughput (tokens/s) |
@@ -48,12 +49,15 @@ python -m llamacpp_loader.main
 
 1. **Choose the llama.cpp folder**: click `llamacpp path` and select the directory containing `llama-server.exe`.
 2. **Add a model**: click `Add model` and choose a GGUF file; each model receives an independent profile.
-3. **Tune parameters**: use `Quick`, `Generation`, and `Advanced`. Quick uses context values in K, KV cache choices F16/Q8/Q4, GPU Auto/Recommend, and balanced 4+4 columns.
-4. **Configure optional capabilities**: Advanced provides aligned Vision, MTP, DFlash, and N-gram rows with On/Off, file selection, clear, and status controls. CPU-MoE lives in the Quick tab.
+3. **Tune parameters**: use `Quick`, `Generation`, and `Advanced`. Quick uses context values in K, KV cache choices F16/Q8/Q4, GPU Auto/Recommend, a tri-state Reasoning selector (auto/on/off) and the Max tokens cap, in balanced 4+5 columns.
+   - **Reasoning** is tri-state: `auto` leaves the decision to llama.cpp (it detects it from the chat template) and emits no flag, `on` always emits `--reasoning on`, and `off` is gated because b10588-era builds crash on it.
+   - **Max tokens** caps the whole generation (`--n-predict`); `0` keeps llama.cpp's default of "run until EOS".
+4. **Set a thinking budget** (Generation tab): `Reasoning budget` caps the reasoning trace *only*, so the answer still fits inside Max tokens. `-1` = unlimited, `0` = stop thinking immediately, `N` = token budget; a blank box emits no flag. `Budget message` is injected when the budget runs out, and `Reasoning effort` is a template-side alternative to a hard token cap. All three are opt-in: llama.cpp exits on arguments it does not recognise, so leaving them blank keeps older builds working.
+5. **Configure optional capabilities**: Advanced provides aligned Vision, MTP, DFlash, and N-gram rows with On/Off, file selection, clear, and status controls. CPU-MoE lives in the Quick tab.
    - **N-gram** is free acceleration (no draft model, no extra VRAM) and *stacks* with the draft tracks: picking `Simple` while MTP is on emits `--spec-type draft-mtp,ngram-simple`. Measured on Qwen3.8-27B: 57 t/s baseline → 87 t/s with MTP → ~117 t/s with MTP + n-gram.
-5. **Launch**: click `Start Server`; the app starts llama-server on the configured port and can open the local Web UI.
-6. **Smoke test**: click `Smoke Test` after launch, or run `python scripts/smoke_live.py` against a running local server.
-7. **Stop**: click `Stop Server` to shut down gracefully; model and layout settings are saved automatically.
+6. **Launch**: click `Start Server`; the app starts llama-server on the configured port and can open the local Web UI.
+7. **Smoke test**: click `Smoke Test` after launch, or run `python scripts/smoke_live.py` against a running local server.
+8. **Stop**: click `Stop Server` to shut down gracefully; model and layout settings are saved automatically.
 
 ## 🏗️ Architecture
 
@@ -82,7 +86,7 @@ llamacpp-loader/
 │   ├── smoke_live.py              # Live smoke test: health check + throughput (tokens/s)
 │   ├── register_all_models.py     # Batch-register GGUF models (MoE/MTP auto-detect)
 │   └── e2e_smoke_check.py         # Headless end-to-end Start -> Smoke Test check
-├── tests/                         # 70 pytest tests
+├── tests/                         # 159 pytest tests
 │   ├── test_config_store.py       # CRUD/validation/persistence/scan_models
 │   ├── test_process_manager.py    # lifecycle/command-build/browser
 │   ├── test_smoke_test.py         # result construction/endpoint checks
@@ -97,7 +101,7 @@ llamacpp-loader/
 
 ```bash
 pip install pytest
-pytest tests/ -v          # 90 tests
+pytest tests/ -v          # 159 tests
 python scripts/smoke_live.py   # live smoke test (requires llama-server running on 8080)
 ```
 

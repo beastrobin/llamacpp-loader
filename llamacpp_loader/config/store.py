@@ -97,6 +97,61 @@ def ngram_label(spec_type: str) -> str:
     return "Off"
 
 
+# Reasoning / thinking controls (verified against llama-server b11026).
+#
+# ``--reasoning`` takes three states, so the profile stores a string instead of
+# a bool.  "auto" is llama.cpp's own default (detect from the chat template) and
+# is deliberately emitted as *no flag at all*: that keeps the command line valid
+# on older builds that only know on/off, and it also matches what the legacy
+# ``reasoning: false`` configs actually did at launch.
+REASONING_MODES: tuple[str, ...] = ("auto", "on", "off")
+
+# ``--reasoning-effort`` levels.  "default" means "keep the template default",
+# so it emits no flag either.
+REASONING_EFFORTS: tuple[str, ...] = (
+    "default", "minimal", "low", "medium", "high", "xhigh", "max",
+)
+
+DEFAULT_REASONING_EFFORT = "default"
+
+
+def normalize_reasoning(value) -> str:
+    """Coerce a persisted reasoning value to one of :data:`REASONING_MODES`.
+
+    Legacy configs stored a bool.  ``False`` maps to "auto" rather than "off"
+    on purpose: builds that refuse ``--reasoning off`` were already launched
+    without any reasoning flag, so "auto" is the behaviour those configs had.
+    """
+    if isinstance(value, bool):
+        return "on" if value else "auto"
+    mode = str(value or "").strip().lower()
+    return mode if mode in REASONING_MODES else "auto"
+
+
+def normalize_reasoning_effort(value) -> str:
+    """Return a valid ``--reasoning-effort`` level, else ``"default"``."""
+    level = str(value or "").strip().lower()
+    return level if level in REASONING_EFFORTS else DEFAULT_REASONING_EFFORT
+
+
+def normalize_reasoning_budget(value) -> Optional[int]:
+    """Normalize a ``--reasoning-budget`` value.
+
+    ``None`` (or an empty string, which is what the GUI sends for a cleared
+    box) means "leave llama.cpp's default alone" and emits no flag at all.
+    Any other value is clamped to ``>= -1``: ``-1`` is unrestricted, ``0``
+    ends thinking immediately, and ``N > 0`` is a token budget.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    try:
+        return max(-1, int(value))
+    except (TypeError, ValueError):
+        return None
+
+
 # --------------------------------------------------------------------------- data classes
 
 
@@ -175,6 +230,21 @@ class InferenceParams:
                                # EOS or the context fills).  A large-but-bounded
                                # value (e.g. 12000) stops long thinking traces
                                # from silently eating a small client budget.
+    # Thinking budget (--reasoning-budget, llama-server >= b10xxx).  This caps
+    # ONLY the thinking trace, so the answer still gets room inside n_predict —
+    # which a bare n_predict cap cannot do.
+    reasoning_budget: Optional[int] = None
+                               # None = omit the flag (llama.cpp default: -1,
+                               # i.e. unrestricted).  -1 unrestricted,
+                               # 0 = end thinking immediately, N > 0 = token cap.
+    reasoning_budget_message: str = ""
+                               # --reasoning-budget-message; text injected right
+                               # before the end-of-thinking tag once the budget
+                               # runs out.  Only emitted together with a budget.
+    reasoning_effort: str = DEFAULT_REASONING_EFFORT
+                               # --reasoning-effort; a template-side hint that
+                               # is often a better lever than a token cap.
+                               # "default" = keep the template default (no flag).
 
     def __post_init__(self):
         object.__setattr__(self, "ctx_size", max(64, self.ctx_size))
@@ -182,6 +252,12 @@ class InferenceParams:
         object.__setattr__(self, "n_batch", max(1, min(self.n_batch, 8192)))
         object.__setattr__(self, "seed", -1 if self.seed < 0 else self.seed)
         object.__setattr__(self, "n_predict", max(0, self.n_predict))
+        object.__setattr__(self, "reasoning_budget",
+                           normalize_reasoning_budget(self.reasoning_budget))
+        object.__setattr__(self, "reasoning_budget_message",
+                           str(self.reasoning_budget_message or "").strip())
+        object.__setattr__(self, "reasoning_effort",
+                           normalize_reasoning_effort(self.reasoning_effort))
 
     # --- validation helpers for runtime mutation ---
     def set_ctx_size(self, val):
@@ -195,6 +271,15 @@ class InferenceParams:
 
     def set_n_predict(self, val):
         object.__setattr__(self, "n_predict", max(0, int(val)))
+
+    def set_reasoning_budget(self, val):
+        object.__setattr__(self, "reasoning_budget", normalize_reasoning_budget(val))
+
+    def set_reasoning_budget_message(self, val):
+        object.__setattr__(self, "reasoning_budget_message", str(val or "").strip())
+
+    def set_reasoning_effort(self, val):
+        object.__setattr__(self, "reasoning_effort", normalize_reasoning_effort(val))
 
     def _revalidate(self) -> None:
         """Re-apply the constructor's clamping after an external setattr."""
@@ -284,7 +369,11 @@ class ModelProfile:
     quant: str = ""                  # quantization level, e.g. "Q4_K_M" (parsed from filename)
     kv_cache: str = "f16"            # KV cache type: f16 / q8_0 / q4_0 ...
     speed: float = 0.0               # measured tokens/s (filled by smoke test)
-    reasoning: bool = False          # "Thinking" toggle — forced ON models can't be disabled
+    reasoning: str = "auto"          # "Thinking": "auto" | "on" | "off"
+                                     # ("auto" = llama.cpp's default, detected
+                                     # from the chat template; see
+                                     # normalize_reasoning()).  Forced-ON models
+                                     # (reasoning_forced) cannot be disabled.
     reasoning_forced: bool = False   # True => Thinking cannot be turned off (greyed "on*")
     n_layers: int = 0                 # GGUF architecture metadata, if available
     context_length: int = 0           # native model context limit, if available
@@ -331,6 +420,9 @@ class ModelProfile:
         if not self.quant and self.gguf_file:
             q = self._detect_quant(self.gguf_file)
             object.__setattr__(self, "quant", q)
+        # Thinking is a tri-state string in current configs but a bool in
+        # legacy ones, so coerce on every construction path.
+        object.__setattr__(self, "reasoning", normalize_reasoning(self.reasoning))
 
     @staticmethod
     def _detect_quant(filename: str) -> str:
@@ -421,7 +513,7 @@ class ModelProfile:
             "quant": self.quant,
             "kv_cache": self.kv_cache,
             "speed": self.speed,
-            "reasoning": self.reasoning,
+            "reasoning": normalize_reasoning(self.reasoning),
             "reasoning_forced": self.reasoning_forced,
             "n_layers": self.n_layers,
             "context_length": self.context_length,
@@ -478,7 +570,10 @@ class ModelProfile:
             quant=data.get("quant", ""),
             kv_cache=data.get("kv_cache", "f16"),
             speed=float(data.get("speed", 0.0) or 0.0),
-            reasoning=bool(data.get("reasoning", False)),
+            # Legacy configs stored a bool here; normalize_reasoning() maps
+            # False -> "auto" (the behaviour those launches really had) and
+            # True -> "on".
+            reasoning=normalize_reasoning(data.get("reasoning", "auto")),
             reasoning_forced=bool(data.get("reasoning_forced", False)),
             n_layers=int(data.get("n_layers", 0) or 0),
             context_length=int(data.get("context_length", 0) or 0),

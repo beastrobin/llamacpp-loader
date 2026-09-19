@@ -9,7 +9,11 @@ from llamacpp_loader.config.budget import estimate_vram
 from llamacpp_loader.config.store import (
     DEFAULT_NGRAM_TYPE,
     NGRAM_LABELS,
+    REASONING_EFFORTS,
+    REASONING_MODES,
     normalize_ngram_type,
+    normalize_reasoning,
+    normalize_reasoning_effort,
     ngram_label,
 )
 from llamacpp_loader.gui import theme
@@ -93,18 +97,35 @@ class ModelDetailPanel(ttk.Frame):
         self._add_field(q_left, 4, "Batch size", "batch", "512", "")
         self._add_field(q_right, 0, "CPU threads", "threads", "4", "")
         self._add_combo(q_right, 1, "Flash Attention", "flash", ("auto", "on", "off"), "auto")
-        # Reasoning is persisted as a boolean and llama-server treats the
-        # option as enabled-or-omitted, so there is no distinct auto state.
-        self._add_combo(q_right, 2, "Reasoning", "reasoning", ("on", "off"), "off")
+        # Reasoning is tri-state.  "auto" leaves the decision to llama.cpp (it
+        # detects it from the chat template) and emits no launch flag at all.
+        self._add_combo(q_right, 2, "Reasoning", "reasoning", REASONING_MODES, "auto")
         self._add_field(q_right, 3, "Parallel", "parallel", "1", "")
+        # Max tokens caps --n-predict so a long thinking trace cannot swallow
+        # the whole generation budget; 0 keeps llama.cpp's default (unbounded).
+        self._add_field(q_right, 4, "Max tokens", "max_tokens", "0", "0 = auto")
         g_left = ttk.Frame(generation, style="Detail.TFrame"); g_left.grid(row=0, column=0, sticky="nw")
         g_right = ttk.Frame(generation, style="Detail.TFrame"); g_right.grid(row=0, column=1, sticky="nw", padx=(48, 0))
         gen_fields = (("Temperature", "temp", "0.7"), ("Top-K", "topk", "40"), ("Top-P", "topp", "0.95"), ("Repeat penalty", "repeat", "1.1"), ("Seed", "seed", "-1"), ("Frequency penalty", "frequency", "0.0"), ("Presence penalty", "presence", "0.0"))
         for row, item in enumerate(gen_fields[:4]): self._add_field(g_left, row, *item, "")
         for row, item in enumerate(gen_fields[4:]): self._add_field(g_right, row, *item, "")
-        # Max tokens caps --n-predict so a long thinking trace cannot swallow
-        # the whole generation budget; 0 keeps llama.cpp's default (unbounded).
-        self._add_field(g_right, 3, "Max tokens", "max_tokens", "0", "0 = auto")
+        # Thinking budget: caps the reasoning trace on its own, so the final
+        # answer still fits inside Max tokens (which caps thinking+answer
+        # together).  Every control here is optional -- llama.cpp exits on
+        # arguments it does not recognise, so a blank box must emit no flag.
+        think = ttk.Frame(generation, style="Detail.TFrame")
+        think.grid(row=1, column=0, columnspan=2, sticky="w", pady=(16, 0))
+        ttk.Label(think, text="Thinking budget").grid(
+            row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 3))
+        self._add_field(think, 1, "Reasoning budget", "reasoning_budget", "",
+                        "blank=off, -1=unlimited, 0=stop, N=tokens")
+        self._add_field(think, 2, "Budget message", "reasoning_budget_msg", "",
+                        "injected when the budget runs out")
+        self._add_combo(think, 3, "Reasoning effort", "reasoning_effort",
+                        REASONING_EFFORTS, "default")
+        ttk.Label(think, text="template-side hint; default = no flag",
+                  style="Dim.TLabel").grid(row=3, column=2, sticky=tk.W,
+                                           padx=(6, 0), pady=2)
         advanced.columnconfigure(0, weight=1)
         self._add_vision_row(advanced, 0)
         self._add_draft_row(advanced, 1, "MTP", "mtp")
@@ -347,7 +368,7 @@ class ModelDetailPanel(ttk.Frame):
     def _commit(self, key, preset=False):
         if self._loading or not self._profile_name: return
         if preset: return self._on_preset(self._profile_name, self._vars[key].get())
-        paths = {"ctx": ("inference.ctx_size", lambda v: int(float(v)*1024)), "gpu": ("inference.gpu_layers", int), "threads": ("inference.n_threads", int), "batch": ("inference.n_batch", int), "parallel": ("inference.n_parallel", int), "seed": ("inference.seed", int), "max_tokens": ("inference.n_predict", lambda v: max(0, int(v))), "temp": ("sampling.temperature", float), "topk": ("sampling.top_k", int), "topp": ("sampling.top_p", float), "repeat": ("sampling.repeat_penalty", float), "frequency": ("sampling.frequency_penalty", float), "presence": ("sampling.presence_penalty", float), "kv": ("kv_cache", lambda v: {"F16":"f16", "Q8":"q8_0", "Q4":"q4_0"}.get(v, v.lower())), "flash": ("server.flash_attn", str), "reasoning": ("reasoning", lambda v: v == "on")}
+        paths = {"ctx": ("inference.ctx_size", lambda v: int(float(v)*1024)), "gpu": ("inference.gpu_layers", int), "threads": ("inference.n_threads", int), "batch": ("inference.n_batch", int), "parallel": ("inference.n_parallel", int), "seed": ("inference.seed", int), "max_tokens": ("inference.n_predict", lambda v: max(0, int(v))), "reasoning_budget": ("inference.reasoning_budget", lambda v: None if not str(v).strip() else int(v)), "reasoning_budget_msg": ("inference.reasoning_budget_message", str), "reasoning_effort": ("inference.reasoning_effort", normalize_reasoning_effort), "temp": ("sampling.temperature", float), "topk": ("sampling.top_k", int), "topp": ("sampling.top_p", float), "repeat": ("sampling.repeat_penalty", float), "frequency": ("sampling.frequency_penalty", float), "presence": ("sampling.presence_penalty", float), "kv": ("kv_cache", lambda v: {"F16":"f16", "Q8":"q8_0", "Q4":"q4_0"}.get(v, v.lower())), "flash": ("server.flash_attn", str), "reasoning": ("reasoning", normalize_reasoning)}
         try: path, conv = paths[key]; self._on_change(self._profile_name, {path: conv(self._vars[key].get())})
         except (KeyError, TypeError, ValueError):
             if self._hint is not None:
@@ -370,7 +391,7 @@ class ModelDetailPanel(ttk.Frame):
             ctx_k = str(i.ctx_size // 1024)
             if ctx_k not in ("32", "64", "128", "256", "512"):
                 ctx_k = min(("32", "64", "128", "256", "512"), key=lambda x: abs(int(x) - i.ctx_size // 1024))
-            vals = {"ctx": ctx_k, "gpu": i.gpu_layers, "kv": {"q8_0":"Q8", "q4_0":"Q4"}.get(profile.kv_cache, "F16"), "threads": i.n_threads, "flash": profile.server.flash_attn, "reasoning": "on" if profile.reasoning else "off", "temp": s.temperature, "topk": s.top_k, "topp": s.top_p, "repeat": s.repeat_penalty, "seed": i.seed, "frequency": s.frequency_penalty, "presence": s.presence_penalty, "batch": i.n_batch, "parallel": i.n_parallel, "max_tokens": i.n_predict or 0}
+            vals = {"ctx": ctx_k, "gpu": i.gpu_layers, "kv": {"q8_0":"Q8", "q4_0":"Q4"}.get(profile.kv_cache, "F16"), "threads": i.n_threads, "flash": profile.server.flash_attn, "reasoning": normalize_reasoning(profile.reasoning), "temp": s.temperature, "topk": s.top_k, "topp": s.top_p, "repeat": s.repeat_penalty, "seed": i.seed, "frequency": s.frequency_penalty, "presence": s.presence_penalty, "batch": i.n_batch, "parallel": i.n_parallel, "max_tokens": i.n_predict or 0, "reasoning_budget": "" if i.reasoning_budget is None else i.reasoning_budget, "reasoning_budget_msg": i.reasoning_budget_message or "", "reasoning_effort": normalize_reasoning_effort(i.reasoning_effort)}
             for k, v in vals.items(): self._vars[k].set(v)
             vision = next((f for f in profile.extra_files if "mmproj" in f.lower() or "clip" in f.lower()), "")
             self._vars["vision_enabled"].set("On" if vision else "Off")

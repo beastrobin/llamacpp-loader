@@ -493,3 +493,126 @@ class TestNPredict:
                          inference=InferenceParams(n_predict=12000))
         back = ModelProfile.from_dict(p.to_dict())
         assert back.inference.n_predict == 12000
+
+
+# ============================================================ thinking controls
+
+
+class TestReasoningTriState:
+    """Thinking became auto/on/off; legacy bools must keep their behaviour."""
+
+    def test_default_is_auto(self):
+        from llamacpp_loader.config.store import ModelProfile
+        assert ModelProfile().reasoning == "auto"
+
+    def test_legacy_bool_false_maps_to_auto(self):
+        """False used to launch with no reasoning flag at all, i.e. auto."""
+        from llamacpp_loader.config.store import ModelProfile
+        assert ModelProfile(reasoning=False).reasoning == "auto"
+        assert ModelProfile.from_dict({"reasoning": False}).reasoning == "auto"
+
+    def test_legacy_bool_true_maps_to_on(self):
+        from llamacpp_loader.config.store import ModelProfile
+        assert ModelProfile(reasoning=True).reasoning == "on"
+        assert ModelProfile.from_dict({"reasoning": True}).reasoning == "on"
+
+    def test_round_trips_every_mode(self):
+        from llamacpp_loader.config.store import ModelProfile
+        for mode in ("auto", "on", "off"):
+            p = ModelProfile(profile_name="m", gguf_file="m.gguf", reasoning=mode)
+            assert ModelProfile.from_dict(p.to_dict()).reasoning == mode
+
+    def test_unknown_value_falls_back_to_auto(self):
+        from llamacpp_loader.config.store import ModelProfile
+        assert ModelProfile(reasoning="banana").reasoning == "auto"
+        assert ModelProfile.from_dict({"reasoning": "banana"}).reasoning == "auto"
+
+    def test_case_insensitive(self):
+        from llamacpp_loader.config.store import ModelProfile
+        assert ModelProfile(reasoning="ON").reasoning == "on"
+
+    def test_missing_key_defaults_to_auto(self):
+        from llamacpp_loader.config.store import ModelProfile
+        assert ModelProfile.from_dict({"profile_name": "m"}).reasoning == "auto"
+
+
+class TestReasoningBudget:
+    """Reasoning budget: None means no flag; -1, 0 and N are real values."""
+
+    def test_default_is_unset(self):
+        from llamacpp_loader.config.store import InferenceParams
+        assert InferenceParams().reasoning_budget is None
+
+    def test_zero_and_minus_one_are_kept(self):
+        from llamacpp_loader.config.store import InferenceParams
+        assert InferenceParams(reasoning_budget=0).reasoning_budget == 0
+        assert InferenceParams(reasoning_budget=-1).reasoning_budget == -1
+
+    def test_clamped_at_minus_one(self):
+        from llamacpp_loader.config.store import InferenceParams
+        assert InferenceParams(reasoning_budget=-500).reasoning_budget == -1
+
+    def test_empty_string_means_unset(self):
+        from llamacpp_loader.config.store import InferenceParams
+        assert InferenceParams(reasoning_budget="").reasoning_budget is None
+        assert InferenceParams(reasoning_budget="   ").reasoning_budget is None
+
+    def test_string_digits_accepted(self):
+        from llamacpp_loader.config.store import InferenceParams
+        assert InferenceParams(reasoning_budget="2048").reasoning_budget == 2048
+
+    def test_garbage_means_unset(self):
+        from llamacpp_loader.config.store import InferenceParams
+        assert InferenceParams(reasoning_budget="abc").reasoning_budget is None
+
+    def test_setter_validates(self):
+        from llamacpp_loader.config.store import InferenceParams
+        ip = InferenceParams()
+        ip.set_reasoning_budget(1024)
+        assert ip.reasoning_budget == 1024
+        ip.set_reasoning_budget("")
+        assert ip.reasoning_budget is None
+
+    def test_profile_round_trips_budget_and_message(self):
+        from llamacpp_loader.config.store import InferenceParams, ModelProfile
+        p = ModelProfile(
+            profile_name="m", gguf_file="m.gguf",
+            inference=InferenceParams(reasoning_budget=3072,
+                                      reasoning_budget_message="wrap up"))
+        back = ModelProfile.from_dict(p.to_dict())
+        assert back.inference.reasoning_budget == 3072
+        assert back.inference.reasoning_budget_message == "wrap up"
+
+    def test_budget_travels_with_presets(self):
+        """Living in InferenceParams is what makes presets carry the budget."""
+        from llamacpp_loader.config.store import InferenceParams, ModelProfile
+        p = ModelProfile(profile_name="m", gguf_file="m.gguf",
+                         inference=InferenceParams(reasoning_budget=4096))
+        p.save_preset("thinking")
+        p.inference.set_reasoning_budget(None)
+        assert p.load_preset("thinking") is True
+        assert p.inference.reasoning_budget == 4096
+
+
+class TestReasoningEffort:
+    def test_default(self):
+        from llamacpp_loader.config.store import InferenceParams
+        assert InferenceParams().reasoning_effort == "default"
+
+    def test_valid_levels_kept_case_insensitively(self):
+        from llamacpp_loader.config.store import InferenceParams
+        assert InferenceParams(reasoning_effort="HIGH").reasoning_effort == "high"
+        assert InferenceParams(reasoning_effort="xhigh").reasoning_effort == "xhigh"
+
+    def test_unknown_falls_back_to_default(self):
+        from llamacpp_loader.config.store import InferenceParams
+        assert InferenceParams(reasoning_effort="banana").reasoning_effort == "default"
+        assert InferenceParams(reasoning_effort=None).reasoning_effort == "default"
+
+    def test_setter_validates(self):
+        from llamacpp_loader.config.store import InferenceParams
+        ip = InferenceParams()
+        ip.set_reasoning_effort("medium")
+        assert ip.reasoning_effort == "medium"
+        ip.set_reasoning_effort("nope")
+        assert ip.reasoning_effort == "default"

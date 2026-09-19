@@ -275,7 +275,9 @@ def main() -> None:
         prof.inference.n_batch = 1024
         prof.inference.n_parallel = 1
         prof.kv_cache = kv_cache
-        prof.reasoning = reasoning
+        # Thinking is a tri-state string now: "on" emits --reasoning on, while
+        # "auto" emits nothing and lets llama.cpp detect it from the template.
+        prof.reasoning = "on" if reasoning else "auto"
         prof.is_moe = is_moe
         prof.mtp_supported = mtp_supported
         if extra:

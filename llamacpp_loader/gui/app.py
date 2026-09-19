@@ -47,6 +47,7 @@ from typing import Optional
 
 from llamacpp_loader import __version__ as APP_VERSION
 from llamacpp_loader.config import recommend
+from llamacpp_loader.config.store import REASONING_MODES, normalize_reasoning
 from llamacpp_loader.gui import theme
 from llamacpp_loader.gui.detail_panel import ModelDetailPanel
 
@@ -914,14 +915,20 @@ class MainWindow:
         self._tooltip_text = ""
 
     def _toggle_reasoning(self, name: str) -> None:
-        """Toggle the Thinking switch. Forced-ON models stay locked."""
+        """Cycle the Thinking cell. Forced-ON models stay locked.
+
+        Click order follows REASONING_MODES: auto (llama.cpp's default) ->
+        on -> off -> auto.
+        """
         profile = self.store.load(name)
         if not profile:
             return
         # Locked models ("on*") cannot disable Thinking.
         if profile.reasoning_forced:
             return
-        self.store.update(name, {"reasoning": not profile.reasoning})
+        current = normalize_reasoning(profile.reasoning)
+        nxt = REASONING_MODES[(REASONING_MODES.index(current) + 1) % len(REASONING_MODES)]
+        self.store.update(name, {"reasoning": nxt})
         self._refresh_model_table(self.store.list_profiles())
 
     def _cpu_moe_menu(self, name: str, x_root: int, y_root: int) -> None:
@@ -988,7 +995,7 @@ class MainWindow:
     def _toggle_reasoning_forced(self, name: str) -> None:
         """Right-click the Thinking cell to lock/unlock Thinking (forced ON).
 
-        Locking forces ``reasoning=True`` (a locked model must think); unlocking
+        Locking forces ``reasoning="on"`` (a locked model must think); unlocking
         restores user control. Persisted to the profile.
         """
         profile = self.store.load(name)
@@ -997,7 +1004,7 @@ class MainWindow:
         new_val = not profile.reasoning_forced
         updates = {"reasoning_forced": new_val}
         if new_val:
-            updates["reasoning"] = True  # locking implies Thinking ON
+            updates["reasoning"] = "on"  # locking implies Thinking ON
         self.store.update(name, updates)
         self._refresh_model_table(self.store.list_profiles())
 
@@ -1755,12 +1762,12 @@ class MainWindow:
             ctx_kb = inf.ctx_size // 1024
             ctx_str = f"{ctx_kb // 1024}M" if ctx_kb >= 1024 else f"{ctx_kb}K"
 
-            # Thinking column: locked "on*" if forced, else on/off toggle text
+            # Thinking column: locked "on*" if forced, else the tri-state text
             forced = profile.reasoning_forced
             if forced:
                 think_str = "on*"  # locked ON — cannot be turned off
             else:
-                think_str = "on" if profile.reasoning else "off"
+                think_str = normalize_reasoning(profile.reasoning)
 
             vision_files = [f for f in profile.extra_files
                           if "mmproj" in f.lower() or "clip" in f.lower()]
@@ -1854,7 +1861,7 @@ class MainWindow:
         return {
             "kv": "f16",
             "ctx": 4096,
-            "reasoning": False,
+            "reasoning": "auto",
             "mtp": False,
             "gpu": -1,
             "threads": 4,
@@ -1898,7 +1905,7 @@ class MainWindow:
         if col == "ctx":
             return profile.inference.ctx_size != d["ctx"]
         if col == "reasoning":
-            return profile.reasoning != d["reasoning"]
+            return normalize_reasoning(profile.reasoning) != d["reasoning"]
         if col == "mtp":
             return profile.mtp_enabled != d["mtp"]
         if col == "gpu":
@@ -3918,7 +3925,7 @@ class _LegacyModelDetailPanel(ttk.Frame):
             "topp": ("sampling.top_p", float), "repeat": ("sampling.repeat_penalty", float),
             "frequency": ("sampling.frequency_penalty", float), "presence": ("sampling.presence_penalty", float),
             "kv": ("kv_cache", str), "flash": ("server.flash_attn", str),
-            "reasoning": ("reasoning", bool),
+            "reasoning": ("reasoning", normalize_reasoning),
         }
         path_type = paths.get(key)
         if not path_type:
