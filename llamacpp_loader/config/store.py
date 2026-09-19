@@ -152,6 +152,24 @@ def normalize_reasoning_budget(value) -> Optional[int]:
         return None
 
 
+def normalize_min_p(value) -> Optional[float]:
+    """Normalize a ``--min-p`` value.
+
+    ``None`` (or an empty string, what the GUI sends for a cleared box) means
+    "leave llama.cpp's default alone" (0.05 on current builds) and emits no
+    flag.  ``0.0`` is a real value that explicitly disables min-p, so the
+    sentinel must stay ``None``.  Anything settable is clamped to 0.0..1.0.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    try:
+        return _clamp(float(value), 0.0, 1.0)
+    except (TypeError, ValueError):
+        return None
+
+
 # --------------------------------------------------------------------------- data classes
 
 
@@ -169,6 +187,12 @@ class SamplingParams:
     repeat_penalty: float = 1.1
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
+    # Min-p sampling (--min-p).  None = omit the flag so llama.cpp applies its
+    # own default (0.05 on current builds) — this keeps existing profiles
+    # byte-compatible with servers launched before the field existed.  0.0 is
+    # a REAL value ("disable min-p", the Hermes/Qwen recipe), so the sentinel
+    # must be None, never 0.0.
+    min_p: Optional[float] = None
 
     def __post_init__(self):
         object.__setattr__(self, "temperature", _clamp(self.temperature, 0.0, 2.0))
@@ -177,6 +201,7 @@ class SamplingParams:
         object.__setattr__(self, "repeat_penalty", _clamp(self.repeat_penalty, 0.0, 3.0))
         object.__setattr__(self, "frequency_penalty", _clamp(self.frequency_penalty, -2.0, 2.0))
         object.__setattr__(self, "presence_penalty", _clamp(self.presence_penalty, -2.0, 2.0))
+        object.__setattr__(self, "min_p", normalize_min_p(self.min_p))
 
     # --- validation helpers for runtime mutation ---
     def set_temperature(self, val):
@@ -196,6 +221,9 @@ class SamplingParams:
 
     def set_presence_penalty(self, val):
         object.__setattr__(self, "presence_penalty", _clamp(val, -2.0, 2.0))
+
+    def set_min_p(self, val):
+        object.__setattr__(self, "min_p", normalize_min_p(val))
 
     def _revalidate(self) -> None:
         """Re-apply the constructor's clamping after an external setattr."""
@@ -223,6 +251,12 @@ class InferenceParams:
     gpu_layers: int = -1       # -1 means auto-detect / all layers; use 0 for CPU-only
     n_threads: int = 4         # physical cores recommended
     n_batch: int = 512         # prompt processing batch size
+    n_ubatch: int = 0          # physical micro-batch size (-ub).  0 = omit the
+                               # flag and let llama.cpp use its default (512)
+                               # regardless of -b.  Hermes-style large-batch
+                               # prefill recipes pair -b 4096 with -ub 2048;
+                               # llama.cpp errors when -ub exceeds -b, so the
+                               # manager clamps the emitted value to n_batch.
     n_parallel: int = 1        # number of parallel sequences (speculative decoding)
     seed: int = -1             # -1 = random seed each run
     n_predict: int = 0         # max tokens to generate per request (--n-predict).
@@ -250,6 +284,7 @@ class InferenceParams:
         object.__setattr__(self, "ctx_size", max(64, self.ctx_size))
         object.__setattr__(self, "n_threads", max(1, self.n_threads))
         object.__setattr__(self, "n_batch", max(1, min(self.n_batch, 8192)))
+        object.__setattr__(self, "n_ubatch", max(0, min(self.n_ubatch, 8192)))
         object.__setattr__(self, "seed", -1 if self.seed < 0 else self.seed)
         object.__setattr__(self, "n_predict", max(0, self.n_predict))
         object.__setattr__(self, "reasoning_budget",
@@ -268,6 +303,9 @@ class InferenceParams:
 
     def set_n_batch(self, val):
         object.__setattr__(self, "n_batch", max(1, min(int(val), 8192)))
+
+    def set_n_ubatch(self, val):
+        object.__setattr__(self, "n_ubatch", max(0, min(int(val), 8192)))
 
     def set_n_predict(self, val):
         object.__setattr__(self, "n_predict", max(0, int(val)))
@@ -303,6 +341,13 @@ class ServerParams:
     port: int = 8080
     flash_attn: str = "auto"      # Flash Attention: "auto" | "on" | "off"
                                  # ("auto" enables it when the GPU/driver supports it)
+    backend_sampling: bool = False
+                                 # --backend-sampling (experimental): run the
+                                 # sampling chain on the GPU backend.  Vendor
+                                 # recipes for integrated-MTP models (Qwen3.x)
+                                 # enable it, and so does the draft via
+                                 # --spec-draft-backend-sampling.  False = omit
+                                 # the flag entirely (llama.cpp default: off).
 
     def __post_init__(self):
         try:
@@ -315,6 +360,7 @@ class ServerParams:
         attn = str(self.flash_attn or "auto").strip().lower()
         object.__setattr__(
             self, "flash_attn", attn if attn in ("auto", "on", "off") else "auto")
+        object.__setattr__(self, "backend_sampling", bool(self.backend_sampling))
 
     # --- validation helpers for runtime mutation ---
     def set_port(self, val):
@@ -328,6 +374,9 @@ class ServerParams:
         attn = str(val or "auto").strip().lower()
         object.__setattr__(
             self, "flash_attn", attn if attn in ("auto", "on", "off") else "auto")
+
+    def set_backend_sampling(self, val):
+        object.__setattr__(self, "backend_sampling", bool(val))
 
     def _revalidate(self) -> None:
         """Re-apply the constructor's validation after an external setattr."""

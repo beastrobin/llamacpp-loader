@@ -121,6 +121,7 @@ class ServerConfig:
     gpu_layers: int = -1
     n_threads: int = 4
     n_batch: int = 512
+    n_ubatch: int = 0             # physical micro-batch (-ub); 0 = omit (llama.cpp default 512)
     n_parallel: int = 1
     seed: int = -1
     temperature: float = 0.7
@@ -129,6 +130,8 @@ class ServerConfig:
     repeat_penalty: float = 1.1
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
+    min_p: Optional[float] = None # --min-p; None = omit (llama.cpp default 0.05),
+                                  # 0.0 = explicitly disable, N = threshold
     kv_cache: str = "f16"          # f16 / q8_0 / q4_0
     n_predict: int = 0             # per-request max tokens (--n-predict); 0 = server default
     reasoning: str = "auto"        # --reasoning: "auto" | "on" | "off".
@@ -155,6 +158,12 @@ class ServerConfig:
     dflash_n_max: int = 7         # draft steps for DFlash (--spec-draft-n-max)
     dflash_enabled: bool = False  # enable DFlash speculative decoding
     flash_attn: str = "auto"      # Flash Attention: "auto" | "on" | "off"
+    backend_sampling: bool = False
+                                  # --backend-sampling + --spec-draft-backend-
+                                  # sampling: run the sampling chain on the GPU
+                                  # backend.  Part of the vendor recipe for
+                                  # integrated-MTP models (Qwen3.x).  False
+                                  # emits nothing (llama.cpp default: off).
     cpu_moe: bool = False         # keep ALL MoE expert weights in CPU RAM (--cpu-moe)
     n_cpu_moe: int = 0            # keep first N layers' MoE experts in CPU (--n-cpu-moe N)
     # N-gram speculative decoding: costs no VRAM and needs no draft model, and
@@ -288,6 +297,71 @@ class ProcessManager:
             return self._state
 
     # -------------------------------------------------------------- lifecycle
+    @staticmethod
+    def _profile_to_server_config(config) -> "ServerConfig":
+        """Map a ModelProfile onto a ServerConfig (single source of truth so
+        tests can exercise the mapping without launching a process)."""
+        server = config.server
+        inference = config.inference
+        sampling = config.sampling
+        model_cmd, profile_port = config.to_server_config()
+        # Pick the first extra file that looks like a vision projector
+        mmproj = ""
+        for f in config.extra_files:
+            if "mmproj" in f.lower() or "clip" in f.lower():
+                mmproj = os.path.join(config.model_path, f) if config.model_path else f
+                break
+        # MTP / DFlash draft models (separate fields so they are not
+        # confused with mmproj or each other).
+        mtp_model = ""
+        if config.mtp_enabled and config.mtp_model:
+            mtp_model = (os.path.join(config.model_path, config.mtp_model)
+                         if config.model_path else config.mtp_model)
+        dflash_model = ""
+        if getattr(config, "dflash_enabled", False) and getattr(config, "dflash_model", ""):
+            dflash_model = (os.path.join(config.model_path, getattr(config, "dflash_model", ""))
+                            if config.model_path else getattr(config, "dflash_model", ""))
+        return ServerConfig(
+            model_path=model_cmd,
+            host=server.host,
+            port=profile_port if profile_port != 8080 else server.port,
+            ctx_size=inference.ctx_size,
+            gpu_layers=inference.gpu_layers,
+            n_threads=inference.n_threads,
+            n_batch=inference.n_batch,
+            n_ubatch=getattr(inference, "n_ubatch", 0),
+            n_parallel=inference.n_parallel,
+            seed=inference.seed,
+            temperature=sampling.temperature,
+            top_k=sampling.top_k,
+            top_p=sampling.top_p,
+            repeat_penalty=sampling.repeat_penalty,
+            frequency_penalty=sampling.frequency_penalty,
+            presence_penalty=sampling.presence_penalty,
+            min_p=getattr(sampling, "min_p", None),
+            kv_cache=config.kv_cache,
+            n_predict=getattr(config.inference, "n_predict", 0),
+            reasoning=normalize_reasoning(getattr(config, "reasoning", "auto")),
+            reasoning_budget=getattr(inference, "reasoning_budget", None),
+            reasoning_budget_message=getattr(inference, "reasoning_budget_message", ""),
+            reasoning_effort=getattr(inference, "reasoning_effort",
+                                     DEFAULT_REASONING_EFFORT),
+            mmproj=mmproj,
+            mtp_enabled=config.mtp_enabled,
+            mtp_model=mtp_model,
+            mtp_native=getattr(config, "mtp_native", False),
+            mtp_n_max=getattr(config, "mtp_n_max", 7),
+            dflash_model=dflash_model,
+            dflash_n_max=getattr(config, "dflash_n_max", 7),
+            dflash_enabled=getattr(config, "dflash_enabled", False),
+            flash_attn=getattr(config.server, "flash_attn", "auto"),
+            backend_sampling=getattr(config.server, "backend_sampling", False),
+            cpu_moe=getattr(config, "cpu_moe", False),
+            n_cpu_moe=getattr(config, "n_cpu_moe", 0),
+            ngram_enabled=getattr(config, "ngram_enabled", False),
+            ngram_type=getattr(config, "ngram_type", "") or "ngram-simple",
+        )
+
     def start(self, config: ServerConfig | ModelProfile) -> bool:
         """Launch the llama.cpp server.
 
@@ -308,63 +382,7 @@ class ProcessManager:
         # Extract ServerConfig from ModelProfile if needed
         MP = _get_model_profile_class()
         if isinstance(config, MP):
-            server = config.server
-            inference = config.inference
-            sampling = config.sampling
-            model_cmd, port = config.to_server_config()
-            # Pick the first extra file that looks like a vision projector
-            mmproj = ""
-            for f in config.extra_files:
-                if "mmproj" in f.lower() or "clip" in f.lower():
-                    mmproj = os.path.join(config.model_path, f) if config.model_path else f
-                    break
-            # MTP / DFlash draft models (separate fields so they are not
-            # confused with mmproj or each other).
-            mtp_model = ""
-            if config.mtp_enabled and config.mtp_model:
-                mtp_model = (os.path.join(config.model_path, config.mtp_model)
-                             if config.model_path else config.mtp_model)
-            dflash_model = ""
-            if getattr(config, "dflash_enabled", False) and getattr(config, "dflash_model", ""):
-                dflash_model = (os.path.join(config.model_path, getattr(config, "dflash_model", ""))
-                                if config.model_path else getattr(config, "dflash_model", ""))
-            sc = ServerConfig(
-                model_path=model_cmd,
-                host=server.host,
-                port=port if port != 8080 else server.port,
-                ctx_size=inference.ctx_size,
-                gpu_layers=inference.gpu_layers,
-                n_threads=inference.n_threads,
-                n_batch=inference.n_batch,
-                n_parallel=inference.n_parallel,
-                seed=inference.seed,
-                temperature=sampling.temperature,
-                top_k=sampling.top_k,
-                top_p=sampling.top_p,
-                repeat_penalty=sampling.repeat_penalty,
-                frequency_penalty=sampling.frequency_penalty,
-                presence_penalty=sampling.presence_penalty,
-                kv_cache=config.kv_cache,
-                n_predict=getattr(config.inference, "n_predict", 0),
-                reasoning=normalize_reasoning(getattr(config, "reasoning", "auto")),
-                reasoning_budget=getattr(inference, "reasoning_budget", None),
-                reasoning_budget_message=getattr(inference, "reasoning_budget_message", ""),
-                reasoning_effort=getattr(inference, "reasoning_effort",
-                                         DEFAULT_REASONING_EFFORT),
-                mmproj=mmproj,
-                mtp_enabled=config.mtp_enabled,
-                mtp_model=mtp_model,
-                mtp_native=getattr(config, "mtp_native", False),
-                mtp_n_max=getattr(config, "mtp_n_max", 7),
-                dflash_model=dflash_model,
-                dflash_n_max=getattr(config, "dflash_n_max", 7),
-                dflash_enabled=getattr(config, "dflash_enabled", False),
-                flash_attn=getattr(config.server, "flash_attn", "auto"),
-                cpu_moe=getattr(config, "cpu_moe", False),
-                n_cpu_moe=getattr(config, "n_cpu_moe", 0),
-                ngram_enabled=getattr(config, "ngram_enabled", False),
-                ngram_type=getattr(config, "ngram_type", "") or "ngram-simple",
-            )
+            sc = self._profile_to_server_config(config)
         elif isinstance(config, ServerConfig):
             sc = config
         else:
@@ -773,10 +791,26 @@ class ProcessManager:
         # Threading
         cmd.extend(["-t", str(config.n_threads)])
         cmd.extend(["-b", str(config.n_batch)])
+        # Physical micro-batch (-ub).  Only emitted when explicitly set (0 =
+        # llama.cpp's own default, 512) AND clamped to n_batch: llama.cpp
+        # refuses to start when -ub exceeds -b, and a launch-killing flag is
+        # worse than a ignored tuning hint.
+        if 0 < config.n_ubatch <= config.n_batch:
+            cmd.extend(["-ub", str(config.n_ubatch)])
+        elif config.n_ubatch > config.n_batch:
+            self._forward_log(
+                f"n_ubatch={config.n_ubatch} exceeds n_batch={config.n_batch}; "
+                "ignoring -ub (llama.cpp requires ubatch <= batch).")
         if config.n_parallel > 1:
             cmd.extend(["-np", str(config.n_parallel)])
         if config.seed >= 0:
             cmd.extend(["--seed", str(config.seed)])
+
+        # Backend sampling (experimental).  Vendor recipes for integrated-MTP
+        # models (Qwen3.x) enable it for both the target and the draft.  Off
+        # (the default) emits nothing, so older builds stay launchable.
+        if config.backend_sampling:
+            cmd.extend(["--backend-sampling", "--spec-draft-backend-sampling"])
 
         # KV cache quantization. Only the types actually accepted by
         # llama.cpp's --cache-type-k/-v are valid; weight quant names such as
@@ -937,6 +971,10 @@ class ProcessManager:
             cmd.extend(["--frequency-penalty", str(config.frequency_penalty)])
         if config.presence_penalty:
             cmd.extend(["--presence-penalty", str(config.presence_penalty)])
+        # Min-p: None = leave llama.cpp's default (0.05) alone; 0.0 explicitly
+        # disables it (the Hermes/Qwen recipe) and N > 0 sets a threshold.
+        if config.min_p is not None:
+            cmd.extend(["--min-p", str(config.min_p)])
 
         # Per-request token cap.  The server default (-1) runs until EOS or
         # the context fills, which lets a long thinking trace swallow the whole

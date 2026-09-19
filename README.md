@@ -18,6 +18,8 @@ It folds the whole "pick a model → tune params → launch → test" workflow y
 
 **Generation** tab — the new **Thinking budget** group: `--reasoning-budget` (token cap for the thinking trace alone), `--reasoning-budget-message` (injected when the budget runs out), and `--reasoning-effort` (template-side hint).
 
+**Hermes-style prefill recipe** — `Ubatch` (`-ub`, Quick tab), `Min-P` (`--min-p`, Generation tab; blank = llama.cpp default 0.05, `0` = explicitly off), and `Bknd sample` (`--backend-sampling` + `--spec-draft-backend-sampling`, Advanced tab). Measured on RTX PRO 6000 WS / Qwen3.8-27B-UD-Q4_K_M: 73.5 t/s baseline → 103.8 t/s with MTP(n2) + backend sampling + `-b 4096 -ub 2048`. Note: MTP draft depth is model-dependent — `n-max 7` measured **zero** gain on this model while `n-max 2` gave +33%.
+
 > Previews use fictional model names and paths only. They are intentionally safe to publish and do not contain a user's local configuration.
 
 ---

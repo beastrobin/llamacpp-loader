@@ -495,6 +495,81 @@ class TestNPredict:
         assert back.inference.n_predict == 12000
 
 
+class TestUbatchAndBackendSampling:
+    """-ub / --backend-sampling (the Hermes prefill recipe) and --min-p."""
+
+    def test_n_ubatch_defaults_to_auto(self):
+        from llamacpp_loader.config.store import InferenceParams
+        assert InferenceParams().n_ubatch == 0
+
+    def test_n_ubatch_clamped_to_0_8192(self):
+        from llamacpp_loader.config.store import InferenceParams
+        assert InferenceParams(n_ubatch=-3).n_ubatch == 0
+        assert InferenceParams(n_ubatch=2048).n_ubatch == 2048
+        assert InferenceParams(n_ubatch=99999).n_ubatch == 8192
+
+    def test_set_n_ubatch_clamps(self):
+        from llamacpp_loader.config.store import InferenceParams
+        ip = InferenceParams()
+        ip.set_n_ubatch(2048)
+        assert ip.n_ubatch == 2048
+        ip.set_n_ubatch(-1)
+        assert ip.n_ubatch == 0
+
+    def test_backend_sampling_defaults_off(self):
+        from llamacpp_loader.config.store import ServerParams
+        assert ServerParams().backend_sampling is False
+
+    def test_backend_sampling_coerced_to_bool(self):
+        from llamacpp_loader.config.store import ServerParams
+        assert ServerParams(backend_sampling=True).backend_sampling is True
+        assert ServerParams(backend_sampling=0).backend_sampling is False
+
+    def test_profile_round_trips_new_fields(self):
+        from llamacpp_loader.config.store import InferenceParams, ModelProfile
+        p = ModelProfile(profile_name="m", gguf_file="m.gguf",
+                         inference=InferenceParams(n_ubatch=2048))
+        p.server.backend_sampling = True
+        back = ModelProfile.from_dict(p.to_dict())
+        assert back.inference.n_ubatch == 2048
+        assert back.server.backend_sampling is True
+
+
+class TestMinP:
+    """--min-p: None = llama.cpp default (0.05); 0.0 is a REAL value (=off)."""
+
+    def test_default_is_none(self):
+        from llamacpp_loader.config.store import SamplingParams
+        assert SamplingParams().min_p is None
+
+    def test_none_is_the_sentinel_not_zero(self):
+        from llamacpp_loader.config.store import SamplingParams
+        # 0.0 explicitly disables min-p and must survive as 0.0.
+        assert SamplingParams(min_p=0.0).min_p == 0.0
+        assert SamplingParams(min_p="").min_p is None
+        assert SamplingParams(min_p=None).min_p is None
+
+    def test_clamped_to_0_1(self):
+        from llamacpp_loader.config.store import SamplingParams
+        assert SamplingParams(min_p=0.1).min_p == 0.1
+        assert SamplingParams(min_p=-0.5).min_p == 0.0
+        assert SamplingParams(min_p=5).min_p == 1.0
+
+    def test_set_min_p(self):
+        from llamacpp_loader.config.store import SamplingParams
+        sp = SamplingParams()
+        sp.set_min_p("0.05")
+        assert sp.min_p == 0.05
+        sp.set_min_p("")
+        assert sp.min_p is None
+
+    def test_round_trips_through_dict(self):
+        from llamacpp_loader.config.store import SamplingParams
+        back = SamplingParams.from_dict({"min_p": 0.0})
+        assert back.min_p == 0.0
+        assert SamplingParams.from_dict({}).min_p is None
+
+
 # ============================================================ thinking controls
 
 

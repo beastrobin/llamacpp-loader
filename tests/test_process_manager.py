@@ -404,6 +404,72 @@ class TestNPredictEmission:
         assert "--n-predict" not in cmd
 
 
+class TestUbatchBackendSamplingAndMinP:
+    """The Hermes prefill recipe: -ub 2048, --backend-sampling, --min-p.
+
+    All three are opt-in: llama.cpp exits on unknown flags, so defaults must
+    emit nothing at all.
+    """
+
+    def test_defaults_emit_nothing(self):
+        cmd = ProcessManager(log_callback=None)._build_command(
+            ServerConfig(model_path="/m.gguf", port=9001))
+        assert "-ub" not in cmd
+        assert "--backend-sampling" not in cmd
+        assert "--spec-draft-backend-sampling" not in cmd
+        assert "--min-p" not in cmd
+
+    def test_ubatch_emitted_when_set(self):
+        cmd = ProcessManager(log_callback=None)._build_command(
+            ServerConfig(model_path="/m.gguf", port=9001,
+                         n_batch=4096, n_ubatch=2048))
+        assert cmd[cmd.index("-ub") + 1] == "2048"
+
+    def test_ubatch_ignored_when_exceeding_batch(self):
+        lines = []
+        cmd = ProcessManager(log_callback=lines.append)._build_command(
+            ServerConfig(model_path="/m.gguf", port=9001,
+                         n_batch=512, n_ubatch=2048))
+        assert "-ub" not in cmd
+        assert any("ubatch" in ln for ln in lines)
+
+    def test_backend_sampling_emits_both_flags(self):
+        cmd = ProcessManager(log_callback=None)._build_command(
+            ServerConfig(model_path="/m.gguf", port=9001, backend_sampling=True))
+        assert "--backend-sampling" in cmd
+        assert "--spec-draft-backend-sampling" in cmd
+
+    def test_min_p_explicit_zero_is_emitted(self):
+        """0.0 disables min-p (Hermes/Qwen recipe); it must NOT be treated
+        as an unset sentinel — that is what None is for."""
+        cmd = ProcessManager(log_callback=None)._build_command(
+            ServerConfig(model_path="/m.gguf", port=9001, min_p=0.0))
+        assert cmd[cmd.index("--min-p") + 1] == "0.0"
+
+    def test_min_p_value_emitted(self):
+        cmd = ProcessManager(log_callback=None)._build_command(
+            ServerConfig(model_path="/m.gguf", port=9001, min_p=0.1))
+        assert cmd[cmd.index("--min-p") + 1] == "0.1"
+
+    def test_min_p_none_omitted(self):
+        cmd = ProcessManager(log_callback=None)._build_command(
+            ServerConfig(model_path="/m.gguf", port=9001, min_p=None))
+        assert "--min-p" not in cmd
+
+    def test_profile_mapping_carries_new_fields(self):
+        from llamacpp_loader.config.store import InferenceParams, ModelProfile
+        profile = ModelProfile(profile_name="m", gguf_file="m.gguf",
+                               inference=InferenceParams(n_batch=4096,
+                                                         n_ubatch=2048))
+        profile.server.backend_sampling = True
+        profile.sampling.min_p = 0.0
+        mgr = ProcessManager(log_callback=None)
+        cmd = mgr._build_command(mgr._profile_to_server_config(profile))
+        assert cmd[cmd.index("-ub") + 1] == "2048"
+        assert "--backend-sampling" in cmd
+        assert cmd[cmd.index("--min-p") + 1] == "0.0"
+
+
 class TestReasoningBudget:
     """--reasoning-budget caps the thinking trace on its own.
 

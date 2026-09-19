@@ -95,6 +95,10 @@ class ModelDetailPanel(ttk.Frame):
         self._add_cpu_moe_row(q_left, 2)
         self._add_combo(q_left, 3, "KV cache", "kv", ("F16", "Q8", "Q4"), "F16")
         self._add_field(q_left, 4, "Batch size", "batch", "512", "")
+        # Physical micro-batch (-ub).  Hermes-style prefill recipes pair a
+        # large -b with -ub; 0 keeps llama.cpp's default (512).  The manager
+        # refuses to emit -ub when it exceeds -b (llama.cpp would not start).
+        self._add_field(q_left, 5, "Ubatch", "ubatch", "0", "0 = auto")
         self._add_field(q_right, 0, "CPU threads", "threads", "4", "")
         self._add_combo(q_right, 1, "Flash Attention", "flash", ("auto", "on", "off"), "auto")
         # Reasoning is tri-state.  "auto" leaves the decision to llama.cpp (it
@@ -106,7 +110,7 @@ class ModelDetailPanel(ttk.Frame):
         self._add_field(q_right, 4, "Max tokens", "max_tokens", "0", "0 = auto")
         g_left = ttk.Frame(generation, style="Detail.TFrame"); g_left.grid(row=0, column=0, sticky="nw")
         g_right = ttk.Frame(generation, style="Detail.TFrame"); g_right.grid(row=0, column=1, sticky="nw", padx=(48, 0))
-        gen_fields = (("Temperature", "temp", "0.7"), ("Top-K", "topk", "40"), ("Top-P", "topp", "0.95"), ("Repeat penalty", "repeat", "1.1"), ("Seed", "seed", "-1"), ("Frequency penalty", "frequency", "0.0"), ("Presence penalty", "presence", "0.0"))
+        gen_fields = (("Temperature", "temp", "0.7"), ("Top-K", "topk", "40"), ("Top-P", "topp", "0.95"), ("Min-P", "minp", ""), ("Repeat penalty", "repeat", "1.1"), ("Seed", "seed", "-1"), ("Frequency penalty", "frequency", "0.0"), ("Presence penalty", "presence", "0.0"))
         for row, item in enumerate(gen_fields[:4]): self._add_field(g_left, row, *item, "")
         for row, item in enumerate(gen_fields[4:]): self._add_field(g_right, row, *item, "")
         # Thinking budget: caps the reasoning trace on its own, so the final
@@ -131,6 +135,14 @@ class ModelDetailPanel(ttk.Frame):
         self._add_draft_row(advanced, 1, "MTP", "mtp")
         self._add_ngram_row(advanced, 2)
         self._add_draft_row(advanced, 3, "DFlash", "dflash")
+        self._add_backend_sampling_row(advanced, 4)
+        # Depth/batch guidance that does not fit on the rows themselves.
+        ttk.Label(advanced,
+                  text="MTP n-max is model-dependent: too deep can nullify the "
+                       "gain (Qwen3.x vendor recipe: 2).  Ubatch requires "
+                       "Batch >= Ubatch.",
+                  style="Dim.TLabel", wraplength=560, justify=tk.LEFT
+                  ).grid(row=5, column=0, sticky="w", pady=(8, 0))
         self._hint = None
         self._bind_mousewheel(self)
         self.after_idle(self._sync_scrollregion)
@@ -300,6 +312,28 @@ class ModelDetailPanel(ttk.Frame):
         self._add_status_entry(line, 0, "ngram_status", column=4)
         self._vars["ngram_status"].set("free speed-up, stacks with MTP")
 
+    def _add_backend_sampling_row(self, parent, row):
+        """Backend sampling — part of the vendor recipe for integrated-MTP
+        models (Qwen3.x); samples on the GPU for both target and draft."""
+        line = self._advanced_row(parent, row, 4)
+        ttk.Label(line, text="Bknd sample", width=10).grid(row=0, column=0, sticky=tk.W, pady=2)
+        mode = tk.StringVar(value="Off")
+        self._vars["backend_sampling"] = mode
+        combo = ttk.Combobox(line, textvariable=mode, values=("Off", "On"),
+                             state="readonly", width=7)
+        combo.grid(row=0, column=1, sticky=tk.W, padx=(8, 4), pady=2)
+        self._inputs["backend_sampling"] = combo
+        combo.bind("<<ComboboxSelected>>", lambda _e: self._commit_backend_sampling())
+        self._add_status_entry(line, 0, "backend_sampling_status", column=4)
+        self._vars["backend_sampling_status"].set(
+            "experimental; recommended with MTP (Qwen3.x)")
+
+    def _commit_backend_sampling(self):
+        if self._loading or not self._profile_name:
+            return
+        self._on_change(self._profile_name, {
+            "server.backend_sampling": self._vars["backend_sampling"].get() == "On"})
+
     def _commit_ngram(self):
         """Persist the n-gram choice; "Off" disables the track entirely."""
         if self._loading or not self._profile_name:
@@ -368,7 +402,7 @@ class ModelDetailPanel(ttk.Frame):
     def _commit(self, key, preset=False):
         if self._loading or not self._profile_name: return
         if preset: return self._on_preset(self._profile_name, self._vars[key].get())
-        paths = {"ctx": ("inference.ctx_size", lambda v: int(float(v)*1024)), "gpu": ("inference.gpu_layers", int), "threads": ("inference.n_threads", int), "batch": ("inference.n_batch", int), "parallel": ("inference.n_parallel", int), "seed": ("inference.seed", int), "max_tokens": ("inference.n_predict", lambda v: max(0, int(v))), "reasoning_budget": ("inference.reasoning_budget", lambda v: None if not str(v).strip() else int(v)), "reasoning_budget_msg": ("inference.reasoning_budget_message", str), "reasoning_effort": ("inference.reasoning_effort", normalize_reasoning_effort), "temp": ("sampling.temperature", float), "topk": ("sampling.top_k", int), "topp": ("sampling.top_p", float), "repeat": ("sampling.repeat_penalty", float), "frequency": ("sampling.frequency_penalty", float), "presence": ("sampling.presence_penalty", float), "kv": ("kv_cache", lambda v: {"F16":"f16", "Q8":"q8_0", "Q4":"q4_0"}.get(v, v.lower())), "flash": ("server.flash_attn", str), "reasoning": ("reasoning", normalize_reasoning)}
+        paths = {"ctx": ("inference.ctx_size", lambda v: int(float(v)*1024)), "gpu": ("inference.gpu_layers", int), "threads": ("inference.n_threads", int), "batch": ("inference.n_batch", int), "ubatch": ("inference.n_ubatch", lambda v: max(0, int(v))), "parallel": ("inference.n_parallel", int), "seed": ("inference.seed", int), "max_tokens": ("inference.n_predict", lambda v: max(0, int(v))), "reasoning_budget": ("inference.reasoning_budget", lambda v: None if not str(v).strip() else int(v)), "reasoning_budget_msg": ("inference.reasoning_budget_message", str), "reasoning_effort": ("inference.reasoning_effort", normalize_reasoning_effort), "temp": ("sampling.temperature", float), "topk": ("sampling.top_k", int), "topp": ("sampling.top_p", float), "minp": ("sampling.min_p", lambda v: None if not str(v).strip() else float(v)), "repeat": ("sampling.repeat_penalty", float), "frequency": ("sampling.frequency_penalty", float), "presence": ("sampling.presence_penalty", float), "kv": ("kv_cache", lambda v: {"F16":"f16", "Q8":"q8_0", "Q4":"q4_0"}.get(v, v.lower())), "flash": ("server.flash_attn", str), "reasoning": ("reasoning", normalize_reasoning)}
         try: path, conv = paths[key]; self._on_change(self._profile_name, {path: conv(self._vars[key].get())})
         except (KeyError, TypeError, ValueError):
             if self._hint is not None:
@@ -391,8 +425,10 @@ class ModelDetailPanel(ttk.Frame):
             ctx_k = str(i.ctx_size // 1024)
             if ctx_k not in ("32", "64", "128", "256", "512"):
                 ctx_k = min(("32", "64", "128", "256", "512"), key=lambda x: abs(int(x) - i.ctx_size // 1024))
-            vals = {"ctx": ctx_k, "gpu": i.gpu_layers, "kv": {"q8_0":"Q8", "q4_0":"Q4"}.get(profile.kv_cache, "F16"), "threads": i.n_threads, "flash": profile.server.flash_attn, "reasoning": normalize_reasoning(profile.reasoning), "temp": s.temperature, "topk": s.top_k, "topp": s.top_p, "repeat": s.repeat_penalty, "seed": i.seed, "frequency": s.frequency_penalty, "presence": s.presence_penalty, "batch": i.n_batch, "parallel": i.n_parallel, "max_tokens": i.n_predict or 0, "reasoning_budget": "" if i.reasoning_budget is None else i.reasoning_budget, "reasoning_budget_msg": i.reasoning_budget_message or "", "reasoning_effort": normalize_reasoning_effort(i.reasoning_effort)}
+            vals = {"ctx": ctx_k, "gpu": i.gpu_layers, "kv": {"q8_0":"Q8", "q4_0":"Q4"}.get(profile.kv_cache, "F16"), "threads": i.n_threads, "flash": profile.server.flash_attn, "reasoning": normalize_reasoning(profile.reasoning), "temp": s.temperature, "topk": s.top_k, "topp": s.top_p, "minp": "" if getattr(s, "min_p", None) is None else s.min_p, "repeat": s.repeat_penalty, "seed": i.seed, "frequency": s.frequency_penalty, "presence": s.presence_penalty, "batch": i.n_batch, "ubatch": getattr(i, "n_ubatch", 0) or 0, "parallel": i.n_parallel, "max_tokens": i.n_predict or 0, "reasoning_budget": "" if i.reasoning_budget is None else i.reasoning_budget, "reasoning_budget_msg": i.reasoning_budget_message or "", "reasoning_effort": normalize_reasoning_effort(i.reasoning_effort)}
             for k, v in vals.items(): self._vars[k].set(v)
+            self._vars["backend_sampling"].set(
+                "On" if getattr(profile.server, "backend_sampling", False) else "Off")
             vision = next((f for f in profile.extra_files if "mmproj" in f.lower() or "clip" in f.lower()), "")
             self._vars["vision_enabled"].set("On" if vision else "Off")
             self._vars["vision_status"].set(Path(vision).name if vision else "Not attached")

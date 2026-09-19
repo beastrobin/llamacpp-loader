@@ -216,6 +216,7 @@ class TestModelDetailPanel:
             kv_cache="q8_0",
             reasoning="on",
             inference=InferenceParams(ctx_size=32768, n_predict=12000,
+                                      n_ubatch=2048,
                                       reasoning_budget=4096,
                                       reasoning_effort="high")))
 
@@ -234,12 +235,13 @@ class TestModelDetailPanel:
         assert panel._pages["Quick"].grid_columnconfigure(0)["weight"] == 0
         assert panel._pages["Generation"].grid_columnconfigure(0)["weight"] == 0
         # CPU-MoE sits immediately below GPU layers and shares its columns.
-        assert {child.grid_info()["row"] for child in panel._quick_columns[0].grid_slaves()} == {0, 1, 2, 3, 4}
+        assert {child.grid_info()["row"] for child in panel._quick_columns[0].grid_slaves()} == {0, 1, 2, 3, 4, 5}
         # Max tokens moved onto Quick, so its right column gained a fifth row.
         assert {child.grid_info()["row"] for child in panel._quick_columns[1].grid_slaves()} == {0, 1, 2, 3, 4}
-        # Advanced is a four-row form, not four explanatory Configure buttons.
+        # Advanced is a five-row form, not four explanatory Configure buttons.
         assert set(panel._capability_status) == {
-            "vision_status", "mtp_status", "dflash_status", "ngram_status"}
+            "vision_status", "mtp_status", "dflash_status", "ngram_status",
+            "backend_sampling_status"}
         assert panel._vars["mtp_n_max"].get() == "7"
         assert panel._inputs["mtp_n_max"].cget("from") == 1.0
         assert panel._inputs["mtp_n_max"].cget("to") == 16.0
@@ -249,6 +251,11 @@ class TestModelDetailPanel:
         assert panel._vars["reasoning_budget"].get() == "4096"
         assert panel._vars["reasoning_effort"].get() == "high"
         assert panel._vars["cpu_moe_mode"].get() == "GPU all"
+        # New tuning fields: ubatch on Quick, Min-P on Generation, backend
+        # sampling on Advanced.
+        assert panel._vars["ubatch"].get() == "2048"
+        assert panel._vars["minp"].get() == ""
+        assert panel._vars["backend_sampling"].get() == "Off"
         assert panel._inputs["cpu_moe_layers"].master is panel._quick_columns[0]
         assert panel._inputs["cpu_moe_mode"].grid_info()["column"] == panel._inputs["gpu"].grid_info()["column"]
         assert panel._inputs["cpu_moe_layers"].grid_info()["column"] == 3
@@ -291,6 +298,22 @@ class TestModelDetailPanel:
         panel._vars["reasoning_budget"].set("")
         panel._commit("reasoning_budget")
         assert ("demo", {"inference.reasoning_budget": None}) in changes
+
+        # Ubatch / Min-P / backend sampling round-trip through their paths.
+        panel._vars["ubatch"].set("2048")
+        panel._commit("ubatch")
+        panel._vars["minp"].set("0.0")
+        panel._commit("minp")
+        panel._vars["backend_sampling"].set("On")
+        panel._commit_backend_sampling()
+        assert ("demo", {"inference.n_ubatch": 2048}) in changes
+        assert ("demo", {"sampling.min_p": 0.0}) in changes
+        assert ("demo", {"server.backend_sampling": True}) in changes
+
+        # A cleared Min-P box is "llama.cpp default", not 0.0 (= disabled).
+        panel._vars["minp"].set("")
+        panel._commit("minp")
+        assert ("demo", {"sampling.min_p": None}) in changes
 
 
 class TestOnClosing:
