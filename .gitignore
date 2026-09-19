@@ -30,6 +30,9 @@ env/
 *.swp
 *.swo
 
+# Local agent workspace state (per-machine notes only, not part of the project).
+.workbuddy/
+
 # Runtime logs (the app creates this dir on first run).
 logs/*
 !logs/.gitkeep
