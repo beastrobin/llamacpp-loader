@@ -164,6 +164,13 @@ class ServerConfig:
                                   # backend.  Part of the vendor recipe for
                                   # integrated-MTP models (Qwen3.x).  False
                                   # emits nothing (llama.cpp default: off).
+    metrics: bool = False
+                                  # --metrics: expose the Prometheus compatible
+                                  # metrics endpoint, which external monitors
+                                  # poll for token throughput, KV cache reuse
+                                  # and speculative decoding acceptance.  False
+                                  # emits nothing (llama.cpp default: disabled),
+                                  # keeping older builds launchable.
     cpu_moe: bool = False         # keep ALL MoE expert weights in CPU RAM (--cpu-moe)
     n_cpu_moe: int = 0            # keep first N layers' MoE experts in CPU (--n-cpu-moe N)
     # N-gram speculative decoding: costs no VRAM and needs no draft model, and
@@ -356,6 +363,7 @@ class ProcessManager:
             dflash_enabled=getattr(config, "dflash_enabled", False),
             flash_attn=getattr(config.server, "flash_attn", "auto"),
             backend_sampling=getattr(config.server, "backend_sampling", False),
+            metrics=getattr(config.server, "metrics", False),
             cpu_moe=getattr(config, "cpu_moe", False),
             n_cpu_moe=getattr(config, "n_cpu_moe", 0),
             ngram_enabled=getattr(config, "ngram_enabled", False),
@@ -811,6 +819,12 @@ class ProcessManager:
         # (the default) emits nothing, so older builds stay launchable.
         if config.backend_sampling:
             cmd.extend(["--backend-sampling", "--spec-draft-backend-sampling"])
+
+        # Observability.  Off by default so builds predating the flag stay
+        # launchable.  The slots endpoint needs no flag here: llama.cpp exposes
+        # it unless --no-slots is passed.
+        if config.metrics:
+            cmd.append("--metrics")
 
         # KV cache quantization. Only the types actually accepted by
         # llama.cpp's --cache-type-k/-v are valid; weight quant names such as

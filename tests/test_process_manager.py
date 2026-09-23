@@ -439,6 +439,26 @@ class TestUbatchBackendSamplingAndMinP:
         assert "--backend-sampling" in cmd
         assert "--spec-draft-backend-sampling" in cmd
 
+    def test_metrics_emits_flag_when_enabled(self):
+        cmd = ProcessManager(log_callback=None)._build_command(
+            ServerConfig(model_path="/m.gguf", port=9001, metrics=True))
+        assert "--metrics" in cmd
+
+    def test_metrics_omitted_by_default(self):
+        """llama.cpp exits on arguments it does not recognise, so the flag is
+        emitted only when the profile actually asks for it."""
+        cmd = ProcessManager(log_callback=None)._build_command(
+            ServerConfig(model_path="/m.gguf", port=9001))
+        assert "--metrics" not in cmd
+
+    def test_metrics_never_touches_slots_flags(self):
+        """llama.cpp exposes /slots by default; --slots would be noise and
+        --no-slots would break external monitoring."""
+        cmd = ProcessManager(log_callback=None)._build_command(
+            ServerConfig(model_path="/m.gguf", port=9001, metrics=True))
+        assert "--slots" not in cmd
+        assert "--no-slots" not in cmd
+
     def test_min_p_explicit_zero_is_emitted(self):
         """0.0 disables min-p (Hermes/Qwen recipe); it must NOT be treated
         as an unset sentinel — that is what None is for."""
@@ -462,11 +482,13 @@ class TestUbatchBackendSamplingAndMinP:
                                inference=InferenceParams(n_batch=4096,
                                                          n_ubatch=2048))
         profile.server.backend_sampling = True
+        profile.server.metrics = True
         profile.sampling.min_p = 0.0
         mgr = ProcessManager(log_callback=None)
         cmd = mgr._build_command(mgr._profile_to_server_config(profile))
         assert cmd[cmd.index("-ub") + 1] == "2048"
         assert "--backend-sampling" in cmd
+        assert "--metrics" in cmd
         assert cmd[cmd.index("--min-p") + 1] == "0.0"
 
 

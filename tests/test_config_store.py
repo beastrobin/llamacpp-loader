@@ -525,14 +525,43 @@ class TestUbatchAndBackendSampling:
         assert ServerParams(backend_sampling=True).backend_sampling is True
         assert ServerParams(backend_sampling=0).backend_sampling is False
 
+    def test_metrics_defaults_off(self):
+        from llamacpp_loader.config.store import ServerParams
+        assert ServerParams().metrics is False
+
+    def test_metrics_coerced_to_bool(self):
+        from llamacpp_loader.config.store import ServerParams
+        assert ServerParams(metrics=True).metrics is True
+        assert ServerParams(metrics=0).metrics is False
+
+    def test_metrics_setter_coerces(self):
+        from llamacpp_loader.config.store import ServerParams
+        sp = ServerParams()
+        sp.set_metrics(True)
+        assert sp.metrics is True
+        sp.set_metrics("")
+        assert sp.metrics is False
+
+    def test_legacy_server_dict_without_metrics_loads_off(self):
+        """Settings written before --metrics existed must still load, and the
+        new key must appear once the profile is saved again."""
+        from llamacpp_loader.config.store import ServerParams
+        legacy = {"host": "127.0.0.1", "port": 8080, "flash_attn": "auto",
+                  "backend_sampling": False}
+        sp = ServerParams.from_dict(legacy)
+        assert sp.metrics is False
+        assert sp.to_dict()["metrics"] is False
+
     def test_profile_round_trips_new_fields(self):
         from llamacpp_loader.config.store import InferenceParams, ModelProfile
         p = ModelProfile(profile_name="m", gguf_file="m.gguf",
                          inference=InferenceParams(n_ubatch=2048))
         p.server.backend_sampling = True
+        p.server.metrics = True
         back = ModelProfile.from_dict(p.to_dict())
         assert back.inference.n_ubatch == 2048
         assert back.server.backend_sampling is True
+        assert back.server.metrics is True
 
 
 class TestMinP:

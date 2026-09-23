@@ -136,13 +136,14 @@ class ModelDetailPanel(ttk.Frame):
         self._add_ngram_row(advanced, 2)
         self._add_draft_row(advanced, 3, "DFlash", "dflash")
         self._add_backend_sampling_row(advanced, 4)
+        self._add_metrics_row(advanced, 5)
         # Depth/batch guidance that does not fit on the rows themselves.
         ttk.Label(advanced,
                   text="MTP n-max is model-dependent: too deep can nullify the "
                        "gain (Qwen3.x vendor recipe: 2).  Ubatch requires "
                        "Batch >= Ubatch.",
                   style="Dim.TLabel", wraplength=560, justify=tk.LEFT
-                  ).grid(row=5, column=0, sticky="w", pady=(8, 0))
+                  ).grid(row=6, column=0, sticky="w", pady=(8, 0))
         self._hint = None
         self._bind_mousewheel(self)
         self.after_idle(self._sync_scrollregion)
@@ -328,6 +329,28 @@ class ModelDetailPanel(ttk.Frame):
         self._vars["backend_sampling_status"].set(
             "experimental; recommended with MTP (Qwen3.x)")
 
+    def _add_metrics_row(self, parent, row):
+        """Prometheus metrics endpoint -- what external monitors poll."""
+        line = self._advanced_row(parent, row, 4)
+        ttk.Label(line, text="Metrics", width=10).grid(
+            row=0, column=0, sticky=tk.W, pady=2)
+        mode = tk.StringVar(value="Off")
+        self._vars["metrics"] = mode
+        combo = ttk.Combobox(line, textvariable=mode, values=("Off", "On"),
+                             state="readonly", width=7)
+        combo.grid(row=0, column=1, sticky=tk.W, padx=(8, 4), pady=2)
+        self._inputs["metrics"] = combo
+        combo.bind("<<ComboboxSelected>>", lambda _e: self._commit_metrics())
+        self._add_status_entry(line, 0, "metrics_status", column=4)
+        self._vars["metrics_status"].set(
+            "Prometheus /metrics endpoint for external monitors")
+
+    def _commit_metrics(self):
+        if self._loading or not self._profile_name:
+            return
+        self._on_change(self._profile_name, {
+            "server.metrics": self._vars["metrics"].get() == "On"})
+
     def _commit_backend_sampling(self):
         if self._loading or not self._profile_name:
             return
@@ -429,6 +452,8 @@ class ModelDetailPanel(ttk.Frame):
             for k, v in vals.items(): self._vars[k].set(v)
             self._vars["backend_sampling"].set(
                 "On" if getattr(profile.server, "backend_sampling", False) else "Off")
+            self._vars["metrics"].set(
+                "On" if getattr(profile.server, "metrics", False) else "Off")
             vision = next((f for f in profile.extra_files if "mmproj" in f.lower() or "clip" in f.lower()), "")
             self._vars["vision_enabled"].set("On" if vision else "Off")
             self._vars["vision_status"].set(Path(vision).name if vision else "Not attached")

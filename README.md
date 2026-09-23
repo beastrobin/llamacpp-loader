@@ -20,6 +20,8 @@ It folds the whole "pick a model → tune params → launch → test" workflow y
 
 **Hermes-style prefill recipe** — `Ubatch` (`-ub`, Quick tab), `Min-P` (`--min-p`, Generation tab; blank = llama.cpp default 0.05, `0` = explicitly off), and `Bknd sample` (`--backend-sampling` + `--spec-draft-backend-sampling`, Advanced tab). Measured on RTX PRO 6000 WS / Qwen3.8-27B-UD-Q4_K_M: 73.5 t/s baseline → 103.8 t/s with MTP(n2) + backend sampling + `-b 4096 -ub 2048`. Note: MTP draft depth is model-dependent — `n-max 7` measured **zero** gain on this model while `n-max 2` gave +33%.
 
+**Observability** — `Metrics` (Advanced tab) adds `--metrics`, exposing llama.cpp's Prometheus endpoint so external dashboards can read token throughput, KV cache reuse and speculative decoding acceptance. Off by default; the slots endpoint needs no flag because llama.cpp enables it already.
+
 > Previews use fictional model names and paths only. They are intentionally safe to publish and do not contain a user's local configuration.
 
 ---

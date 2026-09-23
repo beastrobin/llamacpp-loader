@@ -348,6 +348,16 @@ class ServerParams:
                                  # enable it, and so does the draft via
                                  # --spec-draft-backend-sampling.  False = omit
                                  # the flag entirely (llama.cpp default: off).
+    metrics: bool = False
+                                 # --metrics: expose the Prometheus compatible
+                                 # metrics endpoint.  External monitors need it
+                                 # to read token counters -- generation and
+                                 # prompt throughput, KV cache reuse and
+                                 # speculative decoding acceptance.  False =
+                                 # omit the flag (llama.cpp default: disabled),
+                                 # which also keeps builds predating the flag
+                                 # launchable.  The slots endpoint needs no flag
+                                 # at all: llama.cpp enables it by default.
 
     def __post_init__(self):
         try:
@@ -361,6 +371,7 @@ class ServerParams:
         object.__setattr__(
             self, "flash_attn", attn if attn in ("auto", "on", "off") else "auto")
         object.__setattr__(self, "backend_sampling", bool(self.backend_sampling))
+        object.__setattr__(self, "metrics", bool(self.metrics))
 
     # --- validation helpers for runtime mutation ---
     def set_port(self, val):
@@ -377,6 +388,9 @@ class ServerParams:
 
     def set_backend_sampling(self, val):
         object.__setattr__(self, "backend_sampling", bool(val))
+
+    def set_metrics(self, val):
+        object.__setattr__(self, "metrics", bool(val))
 
     def _revalidate(self) -> None:
         """Re-apply the constructor's validation after an external setattr."""
