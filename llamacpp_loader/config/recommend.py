@@ -23,6 +23,9 @@ from .store import SamplingParams
 # stem wins (checked top-to-bottom, first match).  Keep keywords lowercase and
 # dash/underscore-insensitive (the lookup normalises the stem).
 COMMUNITY_SAMPLING: list[tuple[Iterable[str], dict]] = [
+    # NOTE: no PrismML Ternary Bonsai entry on purpose.  Those files only load
+    # on the vendor's llama.cpp fork (ggml tensor types 142/143), so they are
+    # served by a standalone launcher instead of this loader.
     # Qwen (2.5 / 3 / 3.6): official recommendation ~ temp 0.7, top_p 0.8, top_k 20
     (("qwen",), dict(temperature=0.7, top_k=20, top_p=0.8, repeat_penalty=1.05)),
     # Gemma (2 / 3 / 4): Google recommends temp 1.0, top_k 64, top_p 0.95

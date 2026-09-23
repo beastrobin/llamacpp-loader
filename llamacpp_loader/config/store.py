@@ -442,6 +442,8 @@ class ModelProfile:
     context_length: int = 0           # native model context limit, if available
     n_kv_heads: int = 0               # GGUF KV-cache head count, if available
     head_dim: int = 0                 # GGUF KV-cache key/value head width
+    kv_layers: int = 0                # blocks holding a KV cache (hybrid archs
+                                      # attend on only some of them; 0 = unknown)
 
     # Autonomous capability detection (read from the GGUF at scan/add time).
     is_moe: bool = False             # Mixture-of-Experts (expert_count > 0)
@@ -582,6 +584,7 @@ class ModelProfile:
             "context_length": self.context_length,
             "n_kv_heads": self.n_kv_heads,
             "head_dim": self.head_dim,
+            "kv_layers": self.kv_layers,
             "is_moe": self.is_moe,
             "mtp_supported": self.mtp_supported,
             "mtp_native": self.mtp_native,
@@ -642,6 +645,7 @@ class ModelProfile:
             context_length=int(data.get("context_length", 0) or 0),
             n_kv_heads=int(data.get("n_kv_heads", 0) or 0),
             head_dim=int(data.get("head_dim", 0) or 0),
+            kv_layers=int(data.get("kv_layers", 0) or 0),
             is_moe=bool(data.get("is_moe", False)),
             mtp_supported=bool(data.get("mtp_supported", False)),
             mtp_native=bool(data.get("mtp_native", False)),
@@ -753,6 +757,8 @@ def _enrich_profile_from_gguf(profile: "ModelProfile", gguf_path: Path,
             object.__setattr__(profile, "n_kv_heads", int(meta["n_kv_heads"]))
         if meta.get("head_dim"):
             object.__setattr__(profile, "head_dim", int(meta["head_dim"]))
+        if meta.get("kv_layers"):
+            object.__setattr__(profile, "kv_layers", int(meta["kv_layers"]))
         if meta.get("mtp_supported"):
             object.__setattr__(profile, "mtp_supported", True)
         if meta.get("mtp_native"):

@@ -443,7 +443,11 @@ class ModelDetailPanel(ttk.Frame):
         try:
             self._profile_name = profile.profile_name; self._title.config(text=profile.display_name or profile.profile_name)
             e = estimate_vram(profile)
-            self._summary.config(text=f"Estimated VRAM {e.total_mb/1024:.1f} GB  •  weights {e.weights_mb/1024:.1f} GB  •  KV {e.kv_mb/1024:.1f} GB  •  reserve {e.overhead_mb/1024:.1f} GB")
+            # The projector is a separate file, so showing it inside "weights"
+            # would hide 600 MB of a vision profile's footprint.
+            vision = (f"  •  vision {e.vision_mb/1024:.1f} GB"
+                      if getattr(e, "vision_mb", 0) else "")
+            self._summary.config(text=f"Estimated VRAM {e.total_mb/1024:.1f} GB  •  weights {e.weights_mb/1024:.1f} GB  •  KV {e.kv_mb/1024:.1f} GB  •  reserve {e.overhead_mb/1024:.1f} GB{vision}")
             i, s = profile.inference, profile.sampling
             ctx_k = str(i.ctx_size // 1024)
             if ctx_k not in ("32", "64", "128", "256", "512"):

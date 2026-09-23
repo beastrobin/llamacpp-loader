@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch, PropertyMock
 import pytest
 
 from llamacpp_loader.process_manager.manager import (
+    ProcessState,
     ServerConfig,
     ProcessManager,
 )
@@ -149,6 +150,42 @@ class TestProcessManagerBuildCommand:
         cmd = mgr._build_command(cfg)
         assert "--cpu-moe" in cmd
         assert "--n-cpu-moe" not in cmd
+
+
+class TestParallelSlots:
+    """-np must be sent even for a single slot.
+
+    llama.cpp's own default is "-1 = auto", which current builds resolve to
+    several slots.  With a unified KV cache the total -c is then shared out, so
+    an auto slot count silently serves a fraction of the configured window
+    (observed: -c 131072 became n_ctx_slot 32768 at n_slots = 4) and every
+    extra slot holds its own per-sequence state (~400 MB on a hybrid model).
+    """
+
+    @patch("llamacpp_loader.process_manager.manager.subprocess.Popen")
+    def test_single_slot_is_explicit(self, mock_popen):
+        cfg = ServerConfig(model_path="/models/m.gguf", port=9001, n_parallel=1)
+
+        cmd = ProcessManager(log_callback=None)._build_command(cfg)
+
+        assert cmd[cmd.index("-np") + 1] == "1"
+
+    @patch("llamacpp_loader.process_manager.manager.subprocess.Popen")
+    def test_configured_slot_count_is_forwarded(self, mock_popen):
+        cfg = ServerConfig(model_path="/models/m.gguf", port=9001, n_parallel=4)
+
+        cmd = ProcessManager(log_callback=None)._build_command(cfg)
+
+        assert cmd[cmd.index("-np") + 1] == "4"
+
+    @patch("llamacpp_loader.process_manager.manager.subprocess.Popen")
+    def test_a_negative_value_still_defers_to_llama_cpp(self, mock_popen):
+        """-1 keeps meaning "pick for me"; only that stays unset."""
+        cfg = ServerConfig(model_path="/models/m.gguf", port=9001, n_parallel=-1)
+
+        cmd = ProcessManager(log_callback=None)._build_command(cfg)
+
+        assert "-np" not in cmd
 
 
 class TestNgramSpeculativeDecoding:
@@ -555,3 +592,153 @@ class TestReasoningBudget:
             ServerConfig(model_path="/m.gguf", port=9001, reasoning="on",
                          reasoning_effort="banana"))
         assert "--reasoning-effort" not in cmd
+
+
+# ============================================ crash-loop budget + launch diagnosis
+
+
+class TestAutoRestartBudget:
+    """A model the binary cannot load must stop respawning.
+
+    Regression (the endless-loop report): ``start()`` cleared the
+    consecutive-restart counter on *every* launch, including the relaunch
+    issued by the crash handler.  ``MAX_AUTO_RESTARTS`` was therefore
+    unreachable and llama-server respawned once a second forever whenever the
+    model file itself was the problem -- e.g. a GGUF whose tensors use a ggml
+    type the running build does not implement, which llama-server rejects
+    ~0.3 s after launch.
+    """
+
+    @patch("llamacpp_loader.process_manager.manager.subprocess.Popen")
+    def test_explicit_start_resets_the_budget(self, mock_popen):
+        mgr = ProcessManager(log_callback=None)
+        mgr._restart_attempts = 2
+        assert mgr.start(ServerConfig(model_path="/m.gguf", port=9001)) is True
+        assert mgr._restart_attempts == 0
+
+    @patch("llamacpp_loader.process_manager.manager.subprocess.Popen")
+    def test_crash_relaunch_keeps_the_budget(self, mock_popen):
+        mgr = ProcessManager(log_callback=None)
+        mgr._restart_attempts = 2
+        assert mgr.start(
+            ServerConfig(model_path="/m.gguf", port=9001),
+            reset_restart_budget=False) is True
+        assert mgr._restart_attempts == 2
+
+    def test_crash_handler_relaunches_without_resetting(self):
+        mgr = ProcessManager(log_callback=None)
+        mgr._state = ProcessState.RUNNING
+        mgr._last_config = ServerConfig(model_path="/m.gguf", port=9001)
+        mgr._process = MagicMock()
+        with patch.object(ProcessManager, "start", return_value=True) as start:
+            mgr._handle_crash(1)
+        assert start.call_args.kwargs.get("reset_restart_budget") is False
+
+    def test_loop_gives_up_after_max_auto_restarts(self):
+        """Four consecutive crashes -> three respawns, then ERROR for good."""
+        lines: list[str] = []
+        mgr = ProcessManager(log_callback=lines.append)
+        mgr._last_config = ServerConfig(model_path="/m.gguf", port=9001)
+
+        def fake_start(config, *, reset_restart_budget=True):
+            # Mimic a real launch so the next crash looks like a live server.
+            mgr._state = ProcessState.RUNNING
+            return True
+
+        with patch.object(ProcessManager, "start", side_effect=fake_start):
+            for _ in range(4):
+                mgr._state = ProcessState.RUNNING
+                mgr._process = MagicMock()
+                mgr._handle_crash(1)
+
+        assert mgr._restart_attempts == ProcessManager.MAX_AUTO_RESTARTS
+        assert sum("Auto-restarting" in ln for ln in lines) == 3
+        assert any("Giving up" in ln for ln in lines)
+        assert mgr.state is ProcessState.ERROR
+
+    def test_stop_during_crash_handling_wins(self):
+        """A stop() landing mid-handling must never be resurrected.
+
+        ``_handle_crash`` runs on the watcher thread, so a user pressing Stop
+        at that exact moment is a real race.  Any state other than ERROR means
+        someone else won and the relaunch is skipped.
+        """
+        lines: list[str] = []
+        mgr = ProcessManager(log_callback=lines.append)
+        mgr._state = ProcessState.RUNNING
+        mgr._last_config = ServerConfig(model_path="/m.gguf", port=9001)
+        mgr._process = MagicMock()
+        # A no-op _set_state leaves the observable state at RUNNING, standing
+        # in for "stop() got there first".
+        with patch.object(ProcessManager, "_set_state", return_value=None):
+            with patch.object(ProcessManager, "start", return_value=True) as start:
+                mgr._handle_crash(1)
+        start.assert_not_called()
+        assert any("Auto-restart skipped" in ln for ln in lines)
+
+
+class TestLastErrorLine:
+    """The status bar must be able to explain *why* a launch failed.
+
+    Without this the user only saw a generic smoke-test failure ("connection
+    refused") while the real cause -- e.g. ``tensor 'output.weight' has invalid
+    ggml type 142. should be in [0, 43)`` -- stayed buried in the console.
+    """
+
+    #: The exact line stock llama.cpp printed for the Bonsai 2 ternary GGUFs.
+    BONSAI_REJECTION = (
+        "0.34.120.950 E gguf_init_from_reader: tensor 'output.weight' has "
+        "invalid ggml type 142. should be in [0, 43)")
+
+    def test_empty_when_nothing_captured(self):
+        assert ProcessManager(log_callback=None).last_error_line() == ""
+
+    def test_ignores_ordinary_progress_lines(self):
+        mgr = ProcessManager(log_callback=None)
+        mgr._forward_log("llama_model_loader: loaded meta data")
+        mgr._forward_log("main: server is listening on 127.0.0.1:8080")
+        assert mgr.last_error_line() == ""
+
+    def test_returns_most_recent_error(self):
+        mgr = ProcessManager(log_callback=None)
+        mgr._forward_log("error: first failure")
+        mgr._forward_log("error: second failure")
+        assert mgr.last_error_line() == "error: second failure"
+
+    def test_skips_trailing_noise_after_the_error(self):
+        mgr = ProcessManager(log_callback=None)
+        mgr._forward_log(self.BONSAI_REJECTION)
+        mgr._forward_log("")
+        mgr._forward_log("   ")
+        mgr._forward_log("srv  update_slots: all slots are idle")
+        assert mgr.last_error_line() == self.BONSAI_REJECTION
+
+    def test_recognises_bare_llama_cpp_log_level(self):
+        """llama.cpp brackets its level with spaces: " E module: message"."""
+        mgr = ProcessManager(log_callback=None)
+        mgr._forward_log("load_tensors: offloading 64 repeating layers to GPU")
+        mgr._forward_log("0.91.004.112 E llama_init_from_gpt_params: error "
+                         "loading model")
+        assert "error loading model" in mgr.last_error_line()
+
+    def test_captures_failed_wording(self):
+        mgr = ProcessManager(log_callback=None)
+        mgr._forward_log("Smoke test failed: connection refused")
+        assert mgr.last_error_line() == "Smoke test failed: connection refused"
+
+    def test_recent_output_is_bounded(self):
+        """A server spewing 160 KB of errors must not grow the buffer forever."""
+        mgr = ProcessManager(log_callback=None)
+        for i in range(500):
+            mgr._forward_log(f"error line {i}")
+        assert len(mgr._recent_output) == mgr._recent_output.maxlen
+        assert mgr.last_error_line() == "error line 499"
+
+    def test_log_callback_failure_does_not_break_capture(self):
+        """Diagnostics must survive a broken GUI callback."""
+        def boom(_line):
+            raise RuntimeError("widget destroyed")
+
+        mgr = ProcessManager(log_callback=boom)
+        mgr._forward_log("error: still recorded")
+        assert mgr.last_error_line() == "error: still recorded"

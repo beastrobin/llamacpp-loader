@@ -21,6 +21,7 @@ import tempfile
 import threading
 import time
 import webbrowser
+from collections import deque
 from pathlib import Path
 from dataclasses import dataclass, field
 from enum import Enum
@@ -293,6 +294,12 @@ class ProcessManager:
         #: Consecutive auto-restart attempts since the last healthy start.
         self._restart_attempts = 0
         self._auto_restart = True
+        #: Last output lines from the child process, kept so the GUI can
+        #: explain *why* a launch failed.  llama.cpp prints the real reason
+        #: (e.g. an unsupported tensor type) to the console, which the status
+        #: bar never showed.  ``deque.append`` is atomic, so the reader thread
+        #: can fill it while the UI thread reads it.
+        self._recent_output: deque[str] = deque(maxlen=120)
         # Last resolved llama-server path, used only for registry metadata.
         self._config_store = config_store
         self._cached_server_path: Optional[str] = None
@@ -370,12 +377,19 @@ class ProcessManager:
             ngram_type=getattr(config, "ngram_type", "") or "ngram-simple",
         )
 
-    def start(self, config: ServerConfig | ModelProfile) -> bool:
+    def start(self, config: ServerConfig | ModelProfile,
+              *, reset_restart_budget: bool = True) -> bool:
         """Launch the llama.cpp server.
 
         Args:
             config: Either a ``ServerConfig`` or a ``ModelProfile`` from ConfigStore.
                     If a ModelProfile is passed, its parameters are extracted automatically.
+            reset_restart_budget: Clear the consecutive-auto-restart counter.
+                    Pass ``False`` when re-launching from the crash handler --
+                    resetting it there made ``MAX_AUTO_RESTARTS`` unreachable,
+                    so a model that always fails to load (e.g. a GGUF using a
+                    tensor type the binary does not know) respawned llama-server
+                    forever instead of giving up.
 
         Returns True if subprocess started successfully, False otherwise.
         Sets internal state to STARTING then RUNNING (or ERROR on failure).
@@ -439,7 +453,13 @@ class ProcessManager:
         # previous run first: it would keep polling alongside the new one,
         # leaking a thread per restart and racing the crash handling.
         self._stop_watcher()
-        self._restart_attempts = 0
+        # The auto-restart budget must survive a crash-triggered relaunch:
+        # clearing it unconditionally here reset the counter on every restart,
+        # so the "attempt N/MAX" guard in the crash handler never fired and a
+        # failing model relaunched the server in an endless loop.  Only an
+        # explicit (user-initiated) start clears the counter.
+        if reset_restart_budget:
+            self._restart_attempts = 0
         self._watcher_thread = ProcessWatcher(self, poll_interval=1.0)
         self._watcher_thread.start()
 
@@ -733,11 +753,22 @@ class ProcessManager:
                 f"{attempts} auto-restart attempts.")
             return
 
+        # A stop() issued while this crash was being handled must win: never
+        # resurrect a server the user just shut down.  We set ERROR just above,
+        # so any other value here means someone else moved the state.
+        if self.state != ProcessState.ERROR:
+            self._forward_log(
+                "Auto-restart skipped: server state changed to "
+                f"{self.state.value}.")
+            return
+
         self._restart_attempts = attempts + 1
         self._forward_log(
             f"Server crashed with exit code {returncode}. Auto-restarting "
             f"(attempt {attempts + 1}/{self.MAX_AUTO_RESTARTS})...")
-        if not self.start(config):
+        # reset_restart_budget=False keeps the counter climbing, so the
+        # MAX_AUTO_RESTARTS guard above can actually end a crash loop.
+        if not self.start(config, reset_restart_budget=False):
             self._forward_log("Auto-restart failed to launch the server.")
 
     def _build_command(self, config: ServerConfig) -> list[str]:
@@ -809,7 +840,16 @@ class ProcessManager:
             self._forward_log(
                 f"n_ubatch={config.n_ubatch} exceeds n_batch={config.n_batch}; "
                 "ignoring -ub (llama.cpp requires ubatch <= batch).")
-        if config.n_parallel > 1:
+        # Parallel slots.  Emitted whenever the profile pins a value, INCLUDING
+        # 1: llama.cpp's own default is now "-1 = auto", which current builds
+        # resolve to several slots.  With a unified KV cache the total -c is
+        # then shared out, so an auto slot count silently shrinks the context
+        # the profile asked for (observed: -c 131072 became n_ctx_slot 32768
+        # with n_slots = 4, i.e. the model only ever sees a quarter of its
+        # configured window) and every extra slot holds its own per-sequence
+        # state (~400 MB on a hybrid-attention model, measured).  Only a value
+        # below 1 defers to llama.cpp, which keeps "-1" meaningful as "auto".
+        if config.n_parallel >= 1:
             cmd.extend(["-np", str(config.n_parallel)])
         if config.seed >= 0:
             cmd.extend(["--seed", str(config.seed)])
@@ -1028,6 +1068,10 @@ class ProcessManager:
         If self._log_callback is set, forwards the log line (caller handles threading).
         Logs to logger as fallback.
         """
+        try:
+            self._recent_output.append(line)
+        except Exception:  # noqa: BLE001  -- diagnostics must never break startup
+            pass
         if self._log_callback is not None:
             try:
                 self._log_callback(line)
@@ -1035,6 +1079,28 @@ class ProcessManager:
                 logger.error("Log callback error: %s", exc)
         else:
             logger.info("[SERVER] %s", line)
+
+    def last_error_line(self) -> str:
+        """Return the most recent error-looking line from the server output.
+
+        Used to explain a failed launch in the status bar.  Without this the
+        user only sees a generic smoke-test failure ("connection refused"),
+        while the actual cause -- e.g. ``tensor 'output.weight' has invalid
+        ggml type 142. should be in [0, 43)`` -- stays buried in the console.
+
+        Returns an empty string when nothing error-like was captured.
+        """
+        for line in reversed(self._recent_output):
+            text = (line or "").strip()
+            if not text:
+                continue
+            # llama.cpp log levels are bracketed by spaces ("... E module: msg");
+            # loader-generated lines have no level marker, so also accept an
+            # explicit "error"/"failed" word.
+            lowered = text.lower()
+            if " e " in f" {lowered} " or "error" in lowered or "failed" in lowered:
+                return text
+        return ""
 
     def _open_browser(self, port: int) -> None:
         """Open the default browser to localhost:<port> after successful startup."""

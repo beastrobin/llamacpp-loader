@@ -9,8 +9,10 @@ GGUF file -- no external agent, no network, no manual lookup:
                       Prediction layers (``<arch>.attention.layer_types``
                       contains "mtp"), i.e. it can be sped up with an MTP
                       draft model.
-* ``n_layers`` / ``context_length`` / ``n_kv_heads`` / ``head_dim`` -- used
-  for context-window budgeting.
+* ``n_layers`` / ``context_length`` / ``n_kv_heads`` / ``head_dim`` /
+  ``kv_layers`` -- used for context-window budgeting.  ``kv_layers`` counts the
+  blocks that keep a KV cache, which is fewer than ``n_layers`` on hybrid
+  (linear-attention) architectures.
 
 It is deliberately dependency-light: ``gguf`` (and its ``numpy`` dependency)
 are imported lazily so the GUI never crashes on a machine that does not have
@@ -19,7 +21,9 @@ enable full autonomous detection.
 """
 from __future__ import annotations
 
+import os
 import re
+import struct
 
 from pathlib import Path
 from typing import Any, Optional
@@ -58,14 +62,300 @@ def _field(reader: Any, name: str, default: Any = None) -> Any:
     return val
 
 
+# ----------------------------------------------------------------- raw GGUF scan
+
+#: Metadata lives at the head of a GGUF.  64 MiB comfortably covers even a
+#: 250k-token vocabulary; reading it in one shot keeps the parse to pure
+#: offset arithmetic (no per-entry syscalls).
+_GGUF_HEAD_BYTES = 64 << 20
+#: Bounds for plausibility checks -- a truncated or corrupt header must be
+#: rejected instead of allocating gigabytes.
+_GGUF_MAX_STRING = 1 << 20
+_GGUF_MAX_ELEMS = 1 << 26
+
+#: Upper bound on how many entries of a *wanted* array are materialised.
+_GGUF_MAX_KEEP_ELEMS = 1 << 12
+
+#: ggml metadata value types 0-12 (the GGUF spec set).
+_GGUF_SCALARS = {
+    0: ("<B", 1), 1: ("<b", 1), 2: ("<H", 2), 3: ("<h", 2),
+    4: ("<I", 4), 5: ("<i", 4), 6: ("<f", 4), 7: ("<?", 1),
+    10: ("<Q", 8), 11: ("<q", 8), 12: ("<d", 8),
+}
+_GGUF_T_STRING = 8
+_GGUF_T_ARRAY = 9
+
+#: Metadata keys this module consumes.  Everything else -- above all the
+#: 250k-entry tokenizer vocabularies and merge tables that dominate GGUF
+#: metadata size -- is skipped without materialising a single object.
+_GGUF_WANTED_EXACT = ("general.architecture",)
+_GGUF_WANTED_SUFFIXES = (
+    ".block_count",
+    ".context_length",
+    ".attention.head_count_kv",
+    ".attention.head_count",
+    ".attention.key_length",
+    ".attention.value_length",
+    ".full_attention_interval",
+    ".expert_count",
+    ".attention.layer_types",
+)
+
+
+class _GgufScanError(Exception):
+    """Header truncated or malformed -- the caller should fall back."""
+
+
+class _GgufCursor:
+    """Offset-based reader over an in-memory GGUF header.
+
+    Parsing from one ``bytes`` object rather than a file handle is what makes
+    skipping cheap: advancing past a 250k-entry string array costs a Python
+    integer bump instead of a seek + read per entry.
+    """
+
+    __slots__ = ("data", "pos")
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+        self.pos = 0
+
+    def skip(self, n: int) -> None:
+        if n < 0 or self.pos + n > len(self.data):
+            raise _GgufScanError("truncated header")
+        self.pos += n
+
+    def _take(self, n: int) -> bytes:
+        if n < 0 or self.pos + n > len(self.data):
+            raise _GgufScanError("truncated header")
+        out = self.data[self.pos:self.pos + n]
+        self.pos += n
+        return out
+
+    def u32(self) -> int:
+        return int(struct.unpack("<I", self._take(4))[0])
+
+    def u64(self) -> int:
+        return int(struct.unpack("<Q", self._take(8))[0])
+
+    def string(self, *, keep: bool = True) -> str:
+        n = self.u64()
+        if n > _GGUF_MAX_STRING:
+            raise _GgufScanError("implausible string length")
+        if not keep:
+            self.skip(n)
+            return ""
+        return self._take(n).decode("utf-8", "ignore")
+
+    def value(self, vtype: int, *, keep: bool = True) -> Any:
+        """Read one metadata value, or skip it when *keep* is False."""
+        if vtype == _GGUF_T_STRING:
+            return self.string(keep=keep)
+        if vtype == _GGUF_T_ARRAY:
+            inner = self.u32()
+            count = self.u64()
+            if count > _GGUF_MAX_ELEMS:
+                raise _GgufScanError("implausible array count")
+            if inner in _GGUF_SCALARS:
+                # Fixed-width elements.  Wanted arrays are materialised in
+                # full -- per-layer metadata such as ``attention.head_count_kv``
+                # varies per layer and the caller needs the spread, not just
+                # the first entry.  They are small (one entry per layer), but
+                # the cap keeps a corrupt count from allocating unboundedly.
+                fmt, size = _GGUF_SCALARS[inner]
+                take = count if (keep and count <= _GGUF_MAX_KEEP_ELEMS) else 0
+                items = [struct.unpack(fmt, self._take(size))[0]
+                         for _ in range(take)]
+                self.skip(size * (count - take))
+                return items
+            items: list[Any] = []
+            for _ in range(count):
+                val = self.value(inner, keep=keep)
+                if keep:
+                    items.append(val)
+            return items
+        if vtype in _GGUF_SCALARS:
+            fmt, size = _GGUF_SCALARS[vtype]
+            raw = self._take(size)
+            if not keep:
+                return None
+            return struct.unpack(fmt, raw)[0]
+        raise _GgufScanError(f"unknown metadata value type {vtype}")
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    """Coerce a decoded metadata value to ``int``, tolerating odd types."""
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _layer_metric(primary: Any, fallback: Any) -> int:
+    """Pick a per-layer metric (KV-head count, head width) from GGUF metadata.
+
+    ``attention.head_count_kv`` is a plain scalar on most models but an array
+    with one entry per layer on hybrid architectures: Nemotron-H reports
+    ``[0, 0, 0, 0, 0, 2, 0, ...]`` (only some layers attend at all) and the
+    Gemma-4 sliding-window build reports ``[8, 8, 8, 8, 8, 1, ...]``.  The
+    **largest** entry is what the KV cache must fit: the first entry is
+    meaningless (Nemotron-H starts at 0), and falling back to the *query* head
+    count on such a model overestimates the cache by 16x.
+
+    A present but empty array carries no information, so *fallback* is used.
+    """
+    if isinstance(primary, (list, tuple)):
+        if not primary:
+            return _as_int(fallback)
+        return max((_as_int(v) for v in primary), default=0)
+    if primary is None:
+        return _as_int(fallback)
+    return _as_int(primary)
+
+
+def _kv_layer_count(n_layers: int, kv_heads: Any, interval: Any = 0) -> int:
+    """Number of blocks that actually keep a growing KV cache.
+
+    Hybrid architectures -- now the norm rather than the exception -- do not
+    attend on every layer, and charging the cache to every block overestimates
+    VRAM by the attention ratio (4x on a 4:1 model such as Ternary-Bonsai-2):
+
+    * ``<arch>.attention.head_count_kv`` becomes a per-layer array with ``0``
+      for blocks that hold no cache at all (Nemotron-H reports
+      ``[0, 0, 0, 0, 0, 2, 0, ...]``) -- count the non-zero entries.
+    * Alternating full/linear attention declares its stride explicitly as
+      ``<arch>.full_attention_interval`` (``Ternary-Bonsai-2-27B`` is
+      ``qwen35`` with interval 4, so a 64-block model attends on 16 blocks).
+
+    Anything else -- including a missing or nonsensical stride -- keeps a cache
+    on every layer, which is the historical assumption.
+    """
+    if n_layers <= 0:
+        return 0
+    if isinstance(kv_heads, (list, tuple)) and kv_heads:
+        used = sum(1 for v in kv_heads if _as_int(v) > 0)
+        if used:
+            return used
+        return n_layers
+    stride = _as_int(interval)
+    if 1 < stride <= n_layers:
+        # Full attention lands on the last block of every stride window.
+        return len(range(stride - 1, n_layers, stride))
+    return n_layers
+
+
+def _read_gguf_meta_raw(path: str | Path) -> Optional[dict]:
+    """Read capability metadata straight from the GGUF header bytes.
+
+    Dependency-free and deliberately tolerant: tensor *types* are recorded but
+    never looked up, so a model quantised with a ggml type the installed
+    tooling does not know (e.g. PrismML's ternary ids 142/143, or any id added
+    after this build) still yields arch / layer count / context length.  The
+    ``gguf`` package raises on such files, which is why models like
+    ``Ternary-Bonsai-2-27B`` used to come back with every field zeroed.
+
+    Returns ``None`` when the file is not a readable GGUF v2/v3 -- callers
+    should then fall back to the ``gguf`` package.
+    """
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            head = fh.read(min(size, _GGUF_HEAD_BYTES))
+    except OSError:
+        return None
+    if len(head) < 24 or head[:4] != b"GGUF":
+        return None
+
+    cur = _GgufCursor(head)
+    try:
+        cur.skip(4)                       # magic
+        version = cur.u32()
+        if version not in (2, 3):
+            return None                   # v1 laid the header out differently
+        n_tensors = cur.u64()
+        n_kv = cur.u64()
+
+        meta: dict[str, Any] = {}
+        for _ in range(n_kv):
+            key = cur.string()
+            vtype = cur.u32()
+            wanted = (key in _GGUF_WANTED_EXACT
+                      or key.endswith(_GGUF_WANTED_SUFFIXES))
+            meta[key] = cur.value(vtype, keep=wanted)
+
+        tensor_names: list[str] = []
+        for _ in range(n_tensors):
+            tensor_names.append(cur.string())
+            n_dims = cur.u32()
+            cur.skip(8 * n_dims)          # dimensions
+            cur.skip(4)                   # ggml type id (not validated here)
+            cur.skip(8)                   # data offset
+    except _GgufScanError:
+        return None
+
+    arch: Any = meta.get("general.architecture") or "unknown"
+    if not isinstance(arch, str):
+        arch = str(arch)
+
+    n_layers = _as_int(meta.get(f"{arch}.block_count"))
+    context_length = _as_int(meta.get(f"{arch}.context_length"))
+    kv_heads_raw = meta.get(f"{arch}.attention.head_count_kv")
+    n_kv_heads = _layer_metric(kv_heads_raw,
+                               meta.get(f"{arch}.attention.head_count"))
+    head_dim = _layer_metric(meta.get(f"{arch}.attention.key_length"),
+                             meta.get(f"{arch}.attention.value_length"))
+    expert_count = _as_int(meta.get(f"{arch}.expert_count"))
+    kv_layers = _kv_layer_count(n_layers, kv_heads_raw,
+                                meta.get(f"{arch}.full_attention_interval"))
+
+    layer_types = meta.get(f"{arch}.attention.layer_types")
+    mtp_supported = False
+    if layer_types:
+        if isinstance(layer_types, (list, tuple)):
+            joined = " ".join(str(t) for t in layer_types)
+        else:
+            joined = str(layer_types)
+        mtp_supported = "mtp" in joined.lower()
+
+    # Native MTP head: an extra block at index block_count (blk.<n>.*) or a
+    # "nextn" sub-block.  Without a known block count that test is meaningless
+    # -- "blk.0." would match layer 0 of any model -- so restrict it to an
+    # explicit "nextn" tensor in that case.
+    if n_layers > 0:
+        blk_prefix = f"blk.{n_layers}."
+        blk_head_nextn = f"blk.{n_layers - 1}.nextn."
+        mtp_native = any(
+            name.startswith(blk_prefix)
+            or name.startswith(blk_head_nextn)
+            or "nextn" in name.lower()
+            for name in tensor_names
+        )
+    else:
+        mtp_native = any("nextn" in name.lower() for name in tensor_names)
+
+    return {
+        "arch": arch,
+        "n_layers": n_layers,
+        "context_length": context_length,
+        "n_kv_heads": n_kv_heads,
+        "head_dim": head_dim,
+        "kv_layers": kv_layers,
+        "expert_count": expert_count,
+        "is_moe": expert_count > 0,
+        "mtp_supported": mtp_supported,
+        "mtp_native": mtp_native,
+    }
+
+
 def read_gguf_meta(path: str | Path) -> dict:
     """Return capability metadata read directly from a GGUF file.
 
     Returns a dict with keys: arch, n_layers, context_length, n_kv_heads,
-    head_dim, expert_count, is_moe, mtp_supported, ok.  ``ok`` is False when
-    the file could not be
-    read (e.g. ``gguf`` not installed or not a GGUF) -- callers should treat
-    missing capabilities gracefully.
+    head_dim, kv_layers, expert_count, is_moe, mtp_supported, mtp_native, ok.
+    ``ok`` is False when the file could not be read (not a GGUF, or no reader
+    could parse it) -- callers should treat missing capabilities gracefully.
     """
     result: dict[str, Any] = {
         "arch": "",
@@ -73,12 +363,25 @@ def read_gguf_meta(path: str | Path) -> dict:
         "context_length": 0,
         "n_kv_heads": 0,
         "head_dim": 0,
+        "kv_layers": 0,
         "expert_count": 0,
         "is_moe": False,
         "mtp_supported": False,
         "mtp_native": False,
         "ok": False,
     }
+
+    # Preferred path: dependency-free header scan.  Works without the optional
+    # gguf package at all, tolerates tensor types it does not know, and skips
+    # the multi-megabyte tokenizer arrays -- a 27B model is read in
+    # milliseconds where gguf-python needs ~8 s.
+    raw = _read_gguf_meta_raw(path)
+    if raw is not None:
+        result.update(raw)
+        result["ok"] = True
+        return result
+
+    # Fallback: the optional gguf package, for layouts the raw scanner rejects.
     try:
         from gguf import GGUFReader  # lazy import -- optional dependency
     except Exception:  # noqa: BLE001
@@ -97,18 +400,31 @@ def read_gguf_meta(path: str | Path) -> dict:
 
         n_layers = _field(reader, f"{arch}.block_count") or 0
         ctx = _field(reader, f"{arch}.context_length") or 0
-        n_kv_heads = (_field(reader, f"{arch}.attention.head_count_kv")
-                      or _field(reader, f"{arch}.attention.head_count") or 0)
-        head_dim = (_field(reader, f"{arch}.attention.key_length")
-                    or _field(reader, f"{arch}.attention.value_length") or 0)
+        # Per-layer arrays are common here too (see _layer_metric): passing a
+        # list straight to int() raised, and because this whole block shares
+        # one try/except, that single key silently zeroed every field after it
+        # -- head_dim, expert_count, is_moe and all MTP detection.
+        kv_heads_raw = _field(reader, f"{arch}.attention.head_count_kv")
+        n_kv_heads = _layer_metric(
+            kv_heads_raw,
+            _field(reader, f"{arch}.attention.head_count"))
+        head_dim = _layer_metric(
+            _field(reader, f"{arch}.attention.key_length"),
+            _field(reader, f"{arch}.attention.value_length"))
         experts = _field(reader, f"{arch}.expert_count") or 0
 
-        result["n_layers"] = int(n_layers) if n_layers else 0
-        result["context_length"] = int(ctx) if ctx else 0
-        result["n_kv_heads"] = int(n_kv_heads) if n_kv_heads else 0
-        result["head_dim"] = int(head_dim) if head_dim else 0
-        result["expert_count"] = int(experts) if experts else 0
+        result["n_layers"] = _as_int(n_layers)
+        result["context_length"] = _as_int(ctx)
+        result["n_kv_heads"] = n_kv_heads
+        result["head_dim"] = head_dim
+        result["expert_count"] = _as_int(experts)
         result["is_moe"] = result["expert_count"] > 0
+        # Re-read from the normalised value: a per-layer array would otherwise
+        # be used verbatim in the "blk.<n>." prefix test below.
+        n_layers = result["n_layers"]
+        result["kv_layers"] = _kv_layer_count(
+            n_layers, kv_heads_raw,
+            _field(reader, f"{arch}.full_attention_interval"))
 
         # MTP support: llama.cpp stores per-layer types; a "mtp" entry means
         # the model carries Multi-Token Prediction heads that an MTP draft can
@@ -132,13 +448,14 @@ def read_gguf_meta(path: str | Path) -> dict:
             # (blk.<n>.nextn.* / nextn.*).  Cover both the "block_count
             # excludes the head" and "block_count includes it" conventions
             # (e.g. empero-ai Ridge: block_count=65, head lives at blk.64 with
-            # blk.64.nextn.* tensors).
-            blk_prefix = f"blk.{n_layers}."
-            blk_head_nextn = f"blk.{n_layers - 1}.nextn."
+            # blk.64.nextn.* tensors).  A block count of 0 means the field was
+            # unreadable, and "blk.0." would then match layer 0 of every model.
+            blk_prefix = f"blk.{n_layers}." if n_layers else ""
+            blk_head_nextn = f"blk.{n_layers - 1}.nextn." if n_layers else ""
             for t in reader.tensors:
                 name = t.name
-                if (name.startswith(blk_prefix)
-                        or name.startswith(blk_head_nextn)
+                if ((blk_prefix and name.startswith(blk_prefix))
+                        or (blk_head_nextn and name.startswith(blk_head_nextn))
                         or "nextn" in name.lower()):
                     result["mtp_native"] = True
                     break

@@ -2626,7 +2626,8 @@ class MainWindow:
         """Best-effort refresh of GGUF layer/context metadata on demand."""
         if (getattr(profile, "n_layers", 0)
                 and getattr(profile, "n_kv_heads", 0)
-                and getattr(profile, "head_dim", 0)):
+                and getattr(profile, "head_dim", 0)
+                and getattr(profile, "kv_layers", 0)):
             return profile
         try:
             from llamacpp_loader.config.metadata import read_gguf_meta
@@ -2635,7 +2636,8 @@ class MainWindow:
             if not meta.get("ok"):
                 return profile
             updates = {}
-            for key in ("n_layers", "context_length", "n_kv_heads", "head_dim", "is_moe",
+            for key in ("n_layers", "context_length", "n_kv_heads", "head_dim",
+                        "kv_layers", "is_moe",
                         "mtp_supported", "mtp_native"):
                 value = meta.get(key)
                 if value:
@@ -3484,6 +3486,12 @@ class MainWindow:
             else:
                 # Failed — update UI on main thread
                 detail = result.detail or "Unknown error"
+                # The server's own last error line says *why* the launch failed
+                # (e.g. an unsupported GGUF tensor type); the smoke-test detail
+                # alone only ever reports "connection refused".
+                reason = self.proc_mgr.last_error_line()
+                if reason:
+                    detail = f"{detail} | {reason[-200:]}"
                 self.root.after(
                     0,
                     lambda d=detail: self._status_bar.set_state("error", f"Smoke test failed: {d}"),
