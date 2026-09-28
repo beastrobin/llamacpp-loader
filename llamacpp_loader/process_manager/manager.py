@@ -860,7 +860,8 @@ class ProcessManager:
         if config.backend_sampling:
             cmd.extend(["--backend-sampling", "--spec-draft-backend-sampling"])
 
-        # Observability.  Off by default so builds predating the flag stay
+        # Observability.  On by default (ServerConfig.metrics=True) so every
+        # launch is monitorable; opt out per profile to keep pre-flag builds
         # launchable.  The slots endpoint needs no flag here: llama.cpp exposes
         # it unless --no-slots is passed.
         if config.metrics:

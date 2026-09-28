@@ -348,16 +348,18 @@ class ServerParams:
                                  # enable it, and so does the draft via
                                  # --spec-draft-backend-sampling.  False = omit
                                  # the flag entirely (llama.cpp default: off).
-    metrics: bool = False
+    metrics: bool = True
                                  # --metrics: expose the Prometheus compatible
                                  # metrics endpoint.  External monitors need it
                                  # to read token counters -- generation and
                                  # prompt throughput, KV cache reuse and
-                                 # speculative decoding acceptance.  False =
-                                 # omit the flag (llama.cpp default: disabled),
-                                 # which also keeps builds predating the flag
-                                 # launchable.  The slots endpoint needs no flag
-                                 # at all: llama.cpp enables it by default.
+                                 # speculative decoding acceptance.  True =
+                                 # emit --metrics by default so every launch is
+                                 # observable; set a profile's metrics to false
+                                 # to opt out (also keeps pre-flag llama.cpp
+                                 # builds launchable).  The slots endpoint needs
+                                 # no flag at all: llama.cpp enables it by
+                                 # default.
 
     def __post_init__(self):
         try:
