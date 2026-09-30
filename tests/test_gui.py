@@ -256,7 +256,7 @@ class TestModelDetailPanel:
         assert panel._vars["ubatch"].get() == "2048"
         assert panel._vars["minp"].get() == ""
         assert panel._vars["backend_sampling"].get() == "Off"
-        assert panel._vars["metrics"].get() == "Off"
+        assert panel._vars["metrics"].get() == "On"
         assert panel._inputs["cpu_moe_layers"].master is panel._quick_columns[0]
         assert panel._inputs["cpu_moe_mode"].grid_info()["column"] == panel._inputs["gpu"].grid_info()["column"]
         assert panel._inputs["cpu_moe_layers"].grid_info()["column"] == 3

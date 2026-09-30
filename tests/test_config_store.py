@@ -525,9 +525,9 @@ class TestUbatchAndBackendSampling:
         assert ServerParams(backend_sampling=True).backend_sampling is True
         assert ServerParams(backend_sampling=0).backend_sampling is False
 
-    def test_metrics_defaults_off(self):
+    def test_metrics_defaults_on(self):
         from llamacpp_loader.config.store import ServerParams
-        assert ServerParams().metrics is False
+        assert ServerParams().metrics is True
 
     def test_metrics_coerced_to_bool(self):
         from llamacpp_loader.config.store import ServerParams
@@ -542,15 +542,15 @@ class TestUbatchAndBackendSampling:
         sp.set_metrics("")
         assert sp.metrics is False
 
-    def test_legacy_server_dict_without_metrics_loads_off(self):
-        """Settings written before --metrics existed must still load, and the
-        new key must appear once the profile is saved again."""
+    def test_legacy_server_dict_without_metrics_loads_with_new_default(self):
+        """Settings written before --metrics existed must still load, adopt the
+        on-by-default value, and persist the key once saved again."""
         from llamacpp_loader.config.store import ServerParams
         legacy = {"host": "127.0.0.1", "port": 8080, "flash_attn": "auto",
                   "backend_sampling": False}
         sp = ServerParams.from_dict(legacy)
-        assert sp.metrics is False
-        assert sp.to_dict()["metrics"] is False
+        assert sp.metrics is True
+        assert sp.to_dict()["metrics"] is True
 
     def test_profile_round_trips_new_fields(self):
         from llamacpp_loader.config.store import InferenceParams, ModelProfile
